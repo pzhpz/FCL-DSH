@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.example.fcldsh">
+    
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+        权限中心需要的声明。这些权限大多不是普通运行时权限，
+        而是「需要跳到系统设置页手动开启」的特殊权限，
+        状态检查与跳转逻辑见 PermissionCenter.kt。
+
+        MANAGE_EXTERNAL_STORAGE：让 dsh 能读写共享存储（Download/Documents）。
+        需要 tools:ignore 抑制 lint 的 ScopedStorage 警告 —— 这是本地启动器，
+        用途正当（AI 需要读写用户指定目录），不涉及上架商店的合规问题。
+    -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <!-- Android 13+ 通知权限（普通运行时权限，需要弹窗申请） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 语音相关，供 dsh 侧语音功能使用 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 申请忽略电池优化，避免后台 Node 进程被系统杀掉 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!--
+        引擎下载/安装期间的保活：前台服务 + CPU 唤醒锁。
+        下载几万个 npm 小文件可能持续十几分钟，熄屏后系统会冻结应用网络与 CPU，
+        表现为进度卡住甚至半截包。前台服务声明 dataSync 类型（Android 14 起
+        必须声明类型，否则 startForeground 直接抛异常）。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+        屏幕截图（MediaProjection）需要的前台服务类型权限。
+
+        为什么必须走 MediaProjection 而不是 screencap：
+        agent 实测 `screencap` 退出码 1、写出 0 字节，`screenrecord` 报
+        `no display`，`dumpsys SurfaceFlinger` 被拒 `missing DUMP`。
+        根因是它跑在 SELinux `untrusted_app` 域，既无 CAPTURE_VIDEO_OUTPUT
+        也无 DUMP 权限。MediaProjection 是系统留给普通应用的唯一合法截屏通道，
+        代价是必须由用户点一次系统弹窗同意，且授权不能持久化。
+
+        FOREGROUND_SERVICE_MEDIA_PROJECTION 是 Android 14 起强制的；
+        在更低版本上声明它无副作用。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <application
+        android:allowBackup="true"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true" 
+        android:theme="@style/Theme.App">
+        
+        <!--
+            screenOrientation=sensorLandscape：FCL 风格启动器是横屏应用。
+            用 sensorLandscape 而不是 landscape，这样两个横向都能用（可翻转）。
+            如果只要一个固定方向，改成 landscape。
+
+            configChanges：横屏锁定的情况下，系统仍可能因为字体缩放、语言、
+            键盘插拔等触发重建；而我们的 LauncherState 是 Activity 实例字段，
+            一重建 url / logs / WebView 全丢。声明这些变化由自己处理，避免重建。
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|fontScale|locale|layoutDirection">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            网页运行窗口（仿 FCL 的独立全屏窗口）。
+            由 MainActivity 在拿到带 token 的 URL 后 startActivity 拉起。
+
+            * exported=false：只允许本应用内部启动，不暴露给其他 App。
+            * screenOrientation=fullSensor：**窗口内允许转竖屏**。
+              启动器（MainActivity）仍然锁 sensorLandscape —— 左侧 72dp 导航栏
+              在竖屏下会被挤成一条细缝，而 dsh 自己就是响应式网页，
+              竖屏反而更适合阅读长对话。这里用 fullSensor 而不是 unspecified，
+              是为了不受系统「自动旋转」开关影响：用户明确要求能转竖屏。
+            * 与启动器同样的 configChanges：这个 Activity 持有唯一的 WebView，
+              一旦重建就是整页重载、丢失页面内状态，必须自己接管配置变化。
+        -->
+        <activity
+            android:name=".DshWebActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|fontScale|locale|layoutDirection" />
+
+        <!--
+            dsh 版本的「浏览器下载页」。
+            由下载中心里每个版本行右侧的「浏览器」按钮拉起，只负责把这个版本的
+            tarball 存到本地（不检查是否已下载、不负责安装）。
+
+            * exported=false：只允许本应用内部启动。
+            * 与启动器一样锁 sensorLandscape + 自己接管 configChanges：
+              页面持有下载线程的回调状态，重建会把进度和文件名输入框清空。
+        -->
+        <activity
+            android:name=".DshDownloadPageActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|fontScale|locale|layoutDirection" />
+
+        <!--
+            引擎下载/安装期间的前台保活服务。
+            stopWithTask=false：用户从最近任务里划掉启动器后，下载仍应继续。
+            类型必须是 dataSync（Android 14+ 强制），否则 startForeground 抛异常。
+        -->
+        <service
+            android:name=".EngineTaskService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
+
+        <!--
+            无障碍服务：读屏 + 模拟点击。
+
+            三个属性都不能省，少一个服务就注册不上或被系统拒绝绑定：
+            * android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+              只有持有该签名权限的系统才能绑定本服务，防止任意应用连上来
+              借用读屏与点击能力。这是无障碍服务的强制要求。
+            * android:exported="true"
+              绑定方是**系统进程**（不同进程），必须导出。安全性由上面那条
+              permission 保证，而不是靠不导出。
+            * intent-filter + meta-data
+              前者让系统发现这是一个 AccessibilityService，
+              后者把 res/xml/dsh_accessibility_config.xml 里的能力声明
+              （读屏 / 手势）交给系统。缺 meta-data 时服务能在列表里出现，
+              但 rootInActiveWindow 恒为 null、dispatchGesture 恒失败。
+
+            用户仍需到「系统设置 → 无障碍」里手动开启，应用无法自行启用 ——
+            这是系统的设计，任何引导都只能停在这一步。
+        -->
+        <service
+            android:name=".DshAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/dsh_accessibility_config" />
+        </service>
+
+        <!--
+            屏幕截图服务（MediaProjection）。
+
+            * foregroundServiceType="mediaProjection"：Android 14 起强制，
+              且必须在调 getMediaProjection() **之前** startForeground，
+              否则抛 SecurityException。
+            * exported="false"：只由本应用启动，投屏授权数据不经过这里外泄。
+            * stopWithTask="false"：用户从最近任务划掉启动器时，
+              正在进行的投屏不要被连带拆掉 —— 否则 agent 下一次 /screenshot
+              会突然拿不到帧，而界面上看不出发生了什么。
+
+            注意：MediaProjection 的授权**不能持久化**，每次进程重启后
+            都需要用户再点一次系统弹窗。这是 Android 的设计，无法绕过。
+        -->
+        <service
+            android:name=".ScreenCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection"
+            android:stopWithTask="false" />
+
+        <!--
+            FileProvider：把用户挑选的图片/文件复制进 cache 后，
+            用本应用自己的 content:// 交给 WebView。
+
+            为什么需要它：WebView 的渲染进程是独立沙箱进程。系统选择器
+            （相册 / 文档提供者）返回的 URI 只授予了本应用主进程读权限，
+            渲染进程拿不到，于是「选完图上传卡住 / 传成 0 字节」。
+            换成同 UID 的 FileProvider URI 后，渲染进程必然能读。
+
+            authorities 用 ${applicationId} 而不是写死包名：
+            调试/发布变体若改了 applicationId，写死会导致
+            provider 冲突或找不到（IllegalArgumentException: Failed to find
+            configured root）。
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

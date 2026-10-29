@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 移植自 FoldCraftLauncher: drawable/ic_outline_account_tree_24.xml（多人游戏入口） -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M22,11L22,3L15,3L15,6L9,6L9,3L2,3L2,11L9,11L9,8L11,8L11,20L15,20L15,23L22,23L22,15L15,15L15,18L13,18L13,8L15,8L15,11L22,11zM7,9L4,9L4,5L7,5L7,9zM17,21L17,17L20,17L20,21L17,21zM17,9L17,5L20,5L20,9L17,9z" />
+</vector>

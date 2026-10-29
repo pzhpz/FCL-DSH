@@ -1,0 +1,38 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!--
+        DSH 启动器图标（扁平矢量，无渐变、无阴影）。
+
+        设计：深色圆角方块 + 终端提示符（> 加下划线）。
+        选终端符号而不是字母缩写，是因为它同时表达了两个含义：
+          · dsh 是一个命令行工具（Node CLI）
+          · 这是它的启动器外壳
+        两色扁平：底 #3DDC84（与界面强调色一致），符号 #1B1A1F（与主背景一致）。
+    -->
+
+    <!-- 圆角方块底 -->
+    <path
+        android:fillColor="#3DDC84"
+        android:pathData="M6,2 H18 A4,4 0 0 1 22,6 V18 A4,4 0 0 1 18,22 H6 A4,4 0 0 1 2,18 V6 A4,4 0 0 1 6,2 Z" />
+
+    <!-- 提示符 > -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1B1A1F"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M8.5,8.5 L12,12 L8.5,15.5" />
+
+    <!-- 下划线 _ -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1B1A1F"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:pathData="M13.5,15.5 L17,15.5" />
+</vector>

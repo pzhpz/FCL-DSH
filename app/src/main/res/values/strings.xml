@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FCL-DSH</string>
+
+    <!--
+        无障碍服务的名字与说明。
+        这两条会原样显示在系统「无障碍 → 已下载的服务」列表里，
+        用户要靠它们判断要不要把读屏与点击权交给本应用，
+        所以写清楚用途，不要用「系统服务」之类的模糊说法。
+    -->
+    <string name="accessibility_service_label">FCL-DSH 屏幕操作</string>
+    <string name="accessibility_service_description">允许应用读取当前屏幕的界面内容，并模拟点击、长按等触摸操作。用于让 AI 协助操作界面，只在你主动触发时工作。</string>
+</resources>

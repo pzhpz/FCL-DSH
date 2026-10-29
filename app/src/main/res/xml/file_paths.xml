@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider 的路径白名单。
+
+    只暴露 cacheDir/picker/ 一个目录，且仅在挑选图片时使用：
+    把用户选中的内容复制到这里的临时文件，再把本应用自己的
+    content:// URI 交给 WebView。
+
+    为什么不直接把系统选择器返回的 URI 交给 WebView：
+    那个 URI 属于别的应用（相册/文档提供者），读权限只授予了本应用的
+    主进程；WebView 的渲染进程是**独立的沙箱进程**，拿不到这份授权，
+    表现为「选完图后上传卡住 / 传上去是 0 字节」。
+    换成自己 FileProvider 的 URI 后，渲染进程与提供者同属一个 UID，
+    读取必然成功。
+
+    不要在这里加 <root-path> 或 <external-path>：
+    那会把整个存储或外部存储暴露给 FileProvider，是常见的越权写法。
+-->
+<paths>
+    <cache-path name="picker" path="picker/" />
+</paths>

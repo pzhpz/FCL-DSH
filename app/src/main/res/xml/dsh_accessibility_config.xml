@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    无障碍服务配置。
+
+    三项能力：
+
+    * canRetrieveWindowContent —— 读取屏幕。没有它 rootInActiveWindow 返回 null，
+      整棵树取不到，等于服务白开。
+    * canPerformGestures      —— 点击。dispatchGesture 下发点按手势需要它
+      （API 24+；低版本系统会忽略这个属性，服务仍可用节点级 performAction 点击）。
+    * canTakeScreenshot       —— **截图**（API 30+）。这是本项目原先漏掉的关键一项：
+      没有它 AccessibilityService.takeScreenshot() 会直接失败（errorCode=2
+      NO_ACCESSIBILITY_ACCESS）。加上它以后截屏**不需要 MediaProjection 授权**、
+      不需要用户每次点系统弹窗 —— 只要无障碍服务是开着的就能截。
+      用户需在改动后**重新关闭再开启一次**无障碍服务，新能力才会生效。
+
+    accessibilityEventTypes 刻意只订阅窗口状态与内容变化，而不是 typeAllMask：
+    读屏靠的是主动遍历 rootInActiveWindow，不依赖事件流；订阅全部事件
+    （按键、滚动、焦点…）既没必要，也会让系统把更多界面变化推给我们。
+
+    flagReportViewIds         —— 节点带 viewId，便于按 id 精确定位控件
+    flagRetrieveInteractiveWindows —— 能拿到多窗口（分屏/悬浮窗）的内容
+    flagIncludeNotImportantViews   —— 把标记为「对无障碍不重要」的节点也算进来，
+                                  WebView 里不少元素属于这一类，漏了会读不全
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100" />

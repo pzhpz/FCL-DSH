@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        FCL 风格启动器不使用 AppCompat，全屏由代码控制（见 MainActivity.enterFullscreen）。
+
+        这里只做一件事：把状态栏/导航栏涂成透明。
+        含义是**隐藏系统栏之前的那一帧**不会先闪出一条不透明的色带，
+        而不是靠它来「占满屏幕」—— 光设颜色，栏本身仍然占着高度，
+        内容照样被顶下去一截，真正隐藏必须走 WindowInsetsController。
+
+        注意不要在这里加 android:windowFullscreen：它会把状态栏永久藏死，
+        连边缘划入都唤不出来，与网页窗口（DshWebActivity）
+        可临时划出系统栏的行为就不一致了。
+    -->
+    <style name="Theme.App" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+</resources>

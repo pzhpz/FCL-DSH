@@ -190,7 +190,7 @@ fun DownloadBrowseTab(
                 // 只会让人以为功能已经可用。
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             // 只留「搜索」。原先这里还有「安装整合包」—— 它背后没有下载源，
             // 点下去只能弹一句「尚未接入」，属于假按钮，已按需求去掉。

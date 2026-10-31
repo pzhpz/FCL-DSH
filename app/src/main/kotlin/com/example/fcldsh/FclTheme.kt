@@ -192,10 +192,19 @@ object Fcl {
     val RailInset = 6.dp
 
     /** 设置行内边距，对应 item_launcher_setting_* 的 paddingStart/End 12dp。 */
-    val RowPadding = 12.dp
+    val RowPadding = 10.dp
 
-    /** 设置行最小高度，对应 minHeight 48dp。 */
-    val RowMinHeight = 48.dp
+    /**
+     * 设置行最小高度。
+     *
+     * 原先是照 FCL 的 48dp 抄的，但那套尺寸是为「一行就一个开关」的稀疏列表
+     * 设计的；本项目很多行带两行描述，48dp 起跳会让整页显得松松垮垮。
+     * 降到 36dp 后行高由内容自然撑开，列表密度明显提升。
+     */
+    val RowMinHeight = 36.dp
+
+    /** 分组之间的空隙。原来是 8dp，配合收紧后的行高改成 6dp。 */
+    val SectionGap = 6.dp
 }
 
 /**
@@ -344,6 +353,14 @@ fun FclSettingRow(
     description: String? = null,
     shape: RowShape = RowShape.SINGLE,
     onClick: (() -> Unit)? = null,
+    /**
+     * 描述最多显示几行；null = 不限（保持原行为）。
+     *
+     * 列表类页面（插件列表、下载列表）必须限制：市场里的插件描述动辄
+     * 四五行长文本，不截断的话一屏只搁得下两三个条目。截断后高度可预测，
+     * 一屏能看到多少条是稳定的。
+     */
+    descMaxLines: Int? = null,
     trailing: @Composable RowScope.() -> Unit = {}
 ) {
     val base = if (onClick != null) Modifier.fclClickable { onClick() } else Modifier
@@ -359,7 +376,7 @@ fun FclSettingRow(
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = Fcl.RowMinHeight)
-                    .padding(vertical = 8.dp),
+                    .padding(vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
@@ -382,7 +399,15 @@ fun FclSettingRow(
                     color = Fcl.TextSecondary,
                     fontSize = 12.sp,
                     lineHeight = 16.sp,
-                    modifier = Modifier.padding(bottom = 8.dp)
+                    // null 表示不限行数 —— Text 的 maxLines 参数本身是 Int，
+                    // 传 Int.MAX_VALUE 才是「不限」，不能传 null。
+                    maxLines = descMaxLines ?: Int.MAX_VALUE,
+                    overflow = if (descMaxLines != null) {
+                        TextOverflow.Ellipsis
+                    } else {
+                        TextOverflow.Clip
+                    },
+                    modifier = Modifier.padding(bottom = 6.dp)
                 )
             }
         }
@@ -433,6 +458,6 @@ fun FclSettingSection(title: String, modifier: Modifier = Modifier) {
         text = title,
         color = Fcl.TextSecondary,
         fontSize = 12.sp,
-        modifier = modifier.padding(start = 4.dp, top = 4.dp, bottom = 6.dp)
+        modifier = modifier.padding(start = 4.dp, top = 2.dp, bottom = 4.dp)
     )
 }

@@ -46,6 +46,7 @@ import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -56,10 +57,20 @@ import com.DSHRunner
 /**
  * 侧栏面板进出场动画时长（毫秒）。
  *
- * 220ms 与 FCL 的 `anim_scale` / 页面切换节奏接近：再快会显得突兀，
- * 再慢会让人感觉点完图标后卡了一下才出内容。
+ * 原先是 220ms，按需求**速度减一半**，所以时长翻倍成 440ms。
+ * 配合 [PanelEasing] 的缓入缓出，起步与收尾都更柔和 ——
+ * 匀速做完 440ms 会显得「拖」，加了缓动之后同样时长感觉更快更顺。
  */
-private const val PANEL_ANIM_MS = 220
+private const val PANEL_ANIM_MS = 440
+
+/**
+ * 面板进出的缓动曲线：缓入缓出。
+ *
+ * 用 Material 的 `FastOutSlowInEasing`（cubic-bezier 0.4, 0, 0.2, 1）：
+ * 起步慢、中段快、收尾慢。纯线性在这段时长下会显得机械，
+ * 而且结尾「啪」地停住很生硬。
+ */
+private val PanelEasing = androidx.compose.animation.core.FastOutSlowInEasing
 
 /**
  * 去掉 [LauncherPanel.NONE] 之后的面板列表。
@@ -128,6 +139,24 @@ class MainActivity : ComponentActivity() {
     )
 
     /**
+     * 刚选好、**还没开始安装**的本地引擎包。
+     *
+     * ## 为什么只存 URI，不在这里就开流安装
+     *
+     * 从本地装也要先给实例起名字（与从 registry 下载同样处理）：
+     * 同一个版本可以建多个实例，不命名就会把已有实例悄悄覆盖掉。
+     *
+     * 所以选择器返回后**只记下 URI**，由下载中心弹出命名窗，
+     * 用户点确定之后才真正打开流去安装。
+     *
+     * 不在这里顺手把 `InputStream` 也开出来存着：SAF 的流在
+     * 「选完文件 → 用户思考几十秒 → 点确定」这段时间里可能已经失效
+     * （底层 fd 被回收），届时读出来是空包，症状是「安装完成但找不到 bin.js」。
+     * 到用的时候再开，最稳。
+     */
+    private var pendingLocalZip by mutableStateOf<Uri?>(null)
+
+    /**
      * 从本地选一个引擎 zip 安装。
      *
      * 给「没有稳定下载地址」的情况留退路：把引擎包放进手机存储，
@@ -140,12 +169,8 @@ class MainActivity : ComponentActivity() {
                 ui.log("❌ 未选择引擎包")
                 return@registerForActivityResult
             }
-            val stream = runCatching { contentResolver.openInputStream(uri) }.getOrNull()
-            if (stream == null) {
-                ui.log("❌ 无法读取所选文件")
-                return@registerForActivityResult
-            }
-            DshEngineDownloader.installFrom(this, stream, "本地引擎包")
+            // 先只记下选择，交给命名窗；安装要等用户确认名字之后
+            pendingLocalZip = uri
         }
 
     /**
@@ -207,6 +232,296 @@ class MainActivity : ComponentActivity() {
                 }
             }.start()
         }
+
+    // ── 插件 / 会话的单独导入与导出 ────────────────────────────────
+    //
+    // 与「导出整合包」共用同一套 SAF 思路：CreateDocument 让用户挑保存位置、
+    // GetContent 让用户挑要导入的文件，**不需要任何存储权限**。
+    // 与整合包的区别只有一个：这里打的是纯数据（插件包 / 会话），不含引擎本体，
+    // 因此体积小、速度快，适合日常搬运。
+
+    private val pluginExportLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/zip")
+        ) { uri: Uri? ->
+            if (uri == null) {
+                ui.log("❌ 未选择插件导出位置")
+                return@registerForActivityResult
+            }
+            exportToUri(uri, "正在导出插件") { out ->
+                PluginSessionTransfer.exportPlugins(this, out)
+            }
+        }
+
+    private val pluginImportLauncher =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            if (uri == null) {
+                ui.log("❌ 未选择插件包")
+                return@registerForActivityResult
+            }
+            importFromUri(uri, "正在导入插件") { input ->
+                PluginSessionTransfer.importPlugins(this, input)
+            }
+        }
+
+    private val sessionExportLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/zip")
+        ) { uri: Uri? ->
+            if (uri == null) {
+                ui.log("❌ 未选择会话导出位置")
+                return@registerForActivityResult
+            }
+            exportToUri(uri, "正在导出会话") { out ->
+                PluginSessionTransfer.exportSessions(this, out)
+            }
+        }
+
+    private val sessionImportLauncher =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            if (uri == null) {
+                ui.log("❌ 未选择会话包")
+                return@registerForActivityResult
+            }
+            importFromUri(uri, "正在导入会话") { input ->
+                PluginSessionTransfer.importSessions(this, input)
+            }
+        }
+
+    // ── 单项导出 ────────────────────────────────────────────────────
+    //
+    // 「导出一个插件 / 一个会话」与「全部导出」用的是同一套 SAF，区别只在
+    // 打包时传什么参数。但**参数不能经 lambda 捕获传进回调**：SAF 的启动是
+    // 异步的（用户可能慢慢挑位置），回调触发时那次调用的栈早就没了。
+    // 所以用这两个字段把「要导的是哪一个」带过去，回调里取完立刻清空 ——
+    // 不清空的话，用户取消一次后再点另一个会沿用上一次的目标。
+
+    /** 待导出的插件包名；null 表示当前没有待办的单项插件导出。 */
+    private var pendingPluginExport: String? = null
+
+    /** 待导出的会话标识（[SessionInfo.id]）。 */
+    private var pendingSessionExport: String? = null
+
+    private val singlePluginExportLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/zip")
+        ) { uri: Uri? ->
+            val name = pendingPluginExport
+            pendingPluginExport = null
+            if (uri == null) {
+                ui.log("❌ 未选择导出位置")
+                return@registerForActivityResult
+            }
+            if (name == null) {
+                ui.log("❌ 没有指定要导出的插件")
+                return@registerForActivityResult
+            }
+            exportToUri(uri, "正在导出插件") { out ->
+                PluginSessionTransfer.exportPlugin(this, out, name)
+            }
+        }
+
+    private val singleSessionExportLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/zip")
+        ) { uri: Uri? ->
+            val key = pendingSessionExport
+            pendingSessionExport = null
+            if (uri == null) {
+                ui.log("❌ 未选择导出位置")
+                return@registerForActivityResult
+            }
+            if (key == null) {
+                ui.log("❌ 没有指定要导出的会话")
+                return@registerForActivityResult
+            }
+            exportToUri(uri, "正在导出会话") { out ->
+                PluginSessionTransfer.exportSession(this, out, key)
+            }
+        }
+
+    // ── skill 的导入导出 ────────────────────────────────────────────
+
+    private val skillExportLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/zip")
+        ) { uri: Uri? ->
+            if (uri == null) {
+                ui.log("❌ 未选择 skill 导出位置")
+                return@registerForActivityResult
+            }
+            exportToUri(uri, "正在导出 skill") { out ->
+                PluginSessionTransfer.exportSkills(this, out)
+            }
+        }
+
+    private val skillImportLauncher =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            if (uri == null) {
+                ui.log("❌ 未选择 skill 包")
+                return@registerForActivityResult
+            }
+            importFromUri(uri, "正在导入 skill") { input ->
+                PluginSessionTransfer.importSkills(this, input)
+            }
+        }
+
+    /** 待导出的 skill：目录名 + 所在根目录标签。 */
+    private var pendingSkillExport: Pair<String, String>? = null
+
+    private val singleSkillExportLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/zip")
+        ) { uri: Uri? ->
+            val target = pendingSkillExport
+            pendingSkillExport = null
+            if (uri == null) {
+                ui.log("❌ 未选择导出位置")
+                return@registerForActivityResult
+            }
+            if (target == null) {
+                ui.log("❌ 没有指定要导出的 skill")
+                return@registerForActivityResult
+            }
+            exportToUri(uri, "正在导出 skill") { out ->
+                PluginSessionTransfer.exportSkill(this, out, target.first, target.second)
+            }
+        }
+
+    // ── MCP 的导入导出 ──────────────────────────────────────────────
+
+    private val mcpExportLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/zip")
+        ) { uri: Uri? ->
+            if (uri == null) {
+                ui.log("❌ 未选择 MCP 导出位置")
+                return@registerForActivityResult
+            }
+            exportToUri(uri, "正在导出 MCP") { out ->
+                PluginSessionTransfer.exportMcp(this, out)
+            }
+        }
+
+    private val mcpImportLauncher =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            if (uri == null) {
+                ui.log("❌ 未选择 MCP 包")
+                return@registerForActivityResult
+            }
+            importFromUri(uri, "正在导入 MCP") { input ->
+                PluginSessionTransfer.importMcp(this, input)
+            }
+        }
+
+    /** 待导出的 MCP 配置：相对 `DSH_HOME` 的路径。 */
+    private var pendingMcpExport: String? = null
+
+    private val singleMcpExportLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/zip")
+        ) { uri: Uri? ->
+            val rel = pendingMcpExport
+            pendingMcpExport = null
+            if (uri == null) {
+                ui.log("❌ 未选择导出位置")
+                return@registerForActivityResult
+            }
+            if (rel == null) {
+                ui.log("❌ 没有指定要导出的 MCP 配置")
+                return@registerForActivityResult
+            }
+            exportToUri(uri, "正在导出 MCP") { out ->
+                PluginSessionTransfer.exportMcpConfig(this, out, rel)
+            }
+        }
+
+    /**
+     * 单插件导出的默认文件名。
+     *
+     * scope 包（`@scope/name`）里的 `/` 不能出现在文件名里，
+     * 直接拼会得到一个非法路径：SAF 有些提供方会悄悄截断，
+     * 有些会直接失败。所以把 `@` 去掉、`/` 换成 `-`。
+     */
+    private fun pluginZipName(pkg: String): String =
+        pkg.removePrefix("@").replace('/', '-') + ".zip"
+
+    /**
+     * 把数据打包写进用户选定的位置。
+     *
+     * ## 为什么要在这里删掉失败留下的空文件
+     *
+     * 文件选择器在用户点「确定」的瞬间就把文件建好了。打包失败时不清掉，
+     * 用户手上会多出一个 0 字节的 zip，还会以为备份成功了。
+     * 删除失败也无所谓（部分 SAF 提供方不支持 deleteDocument），所以整体吞掉。
+     *
+     * @param work 在后台线程往输出流里写包，返回给人看的结果说明
+     */
+    private fun exportToUri(uri: Uri, label: String, work: (java.io.OutputStream) -> String) {
+        // 前台保活：插件包可能几千个小文件，边打包边切走应用不能被冻结在半截
+        EngineTaskService.start(this, label)
+
+        Thread {
+            // 只有「我们自己没能开始打包」时才在这里补日志 ——
+            // 成功/失败细节已由 PluginSessionTransfer 写进日志面板，
+            // 重复打印会让同一条结果出现两次。
+            var logHere = false
+            val msg = runCatching {
+                val out = contentResolver.openOutputStream(uri)
+                if (out == null) {
+                    logHere = true
+                    "❌ 无法打开所选位置的写入流"
+                } else {
+                    out.use { work(it) }
+                }
+            }.getOrElse { e ->
+                logHere = true
+                "❌ $label 失败: ${e.message ?: e.javaClass.simpleName}"
+            }
+
+            if (logHere) runOnUiThread { ui.log(msg) }
+
+            if (msg.startsWith("❌")) {
+                val removed = runCatching {
+                    android.provider.DocumentsContract.deleteDocument(contentResolver, uri)
+                }.getOrDefault(false)
+                runOnUiThread {
+                    if (removed) {
+                        ui.log("🧹 已删除未完成的空文件，避免留下 0 字节压缩包")
+                    } else {
+                        ui.log("⚠️ 请手动删除目标位置的空白压缩包")
+                    }
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * 从用户选定的文件里导入数据，**直接写入 dsh**。
+     *
+     * 结果提示统一由 [PluginSessionTransfer] 写进日志面板；这里只补
+     * 「流都打不开」这一类失败 —— 那种情况还没走到业务逻辑。
+     */
+    private fun importFromUri(uri: Uri, label: String, work: (java.io.InputStream) -> String) {
+        EngineTaskService.start(this, label)
+
+        Thread {
+            runCatching {
+                val input = contentResolver.openInputStream(uri)
+                if (input == null) {
+                    "❌ 无法读取所选文件"
+                } else {
+                    input.use { work(it) }
+                }
+            }.onFailure { e ->
+                runOnUiThread {
+                    ui.log("❌ $label 失败: ${e.message ?: e.javaClass.simpleName}")
+                }
+            }.onSuccess { msg ->
+                if (msg.startsWith("❌")) runOnUiThread { ui.log(msg) }
+            }
+        }.start()
+    }
 
     /**
      * 投屏授权（MediaProjection）的结果回调。
@@ -294,31 +609,49 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 删除当前引擎版本：先停实例，再后台递归删除，进度写进共享状态。
+     * 删除当前实例：先停进程，再后台递归删除，进度写进共享状态。
+     *
+     * ## 「删除版本」现在就是「删除实例」
+     *
+     * 以前一个版本就是一个部署，所以「删版本」天然等于删掉整个引擎与数据目录。
+     * 现在同一个版本可以有多个实例，版本号不再是实例的标识 ——
+     * 继续按「只删引擎版本」来理解会留下一个半死状态：实例还在，
+     * 但没有引擎可启动。
+     *
+     * 所以这个按钮删的是 `instances/<id>/` **整个目录**：
+     * 引擎、工作区（Documents）、会话、凭据、插件一起消失。
+     * 确认弹窗已经把这一点写清楚，并建议先导出备份。
+     *
+     * 老部署（没有实例、数据仍挂在 `filesDir` 下）回落到按版本删除，
+     * 否则升级后这个按钮会完全没反应。
      *
      * ## 顺序为什么必须是「先停再删」
      *
-     * 删除的是 `usr/lib/versions/<ver>` 和 `home/.dsh-<ver>`。
-     * 若 dsh 进程还在跑，它正持有着这两个目录里的文件（日志、会话写到一半），
+     * 若 dsh 进程还在跑，它正持有着目录里的文件（日志、会话写到一半）。
      * Linux 允许删除已打开的文件，但进程会继续往里写 —— 结果是
      * 「目录删了、磁盘空间没释放、进程行为诡异」，下次启动还会报错。
      * 所以先走 [stopForInstanceSettings]，它对正在运行的实例会等待退出。
      */
-    private fun requestDeleteVersion(state: LauncherState) {
-        val version = state.engineVersion
-        if (version == null) {
-            ui.log("❌ 当前没有可删除的引擎版本")
-            return
-        }
+    private fun requestDeleteInstance(state: LauncherState) {
         // 防重入：删除按钮在 UI 侧已禁用，这里再挡一次（回调可能被连点触发）
         if (state.deletingVersion != null) return
 
-        stopForInstanceSettings("准备删除引擎 $version")
+        val instance = Instances.active(this)
+        val version = state.engineVersion
+        // 老部署（没有实例、数据仍挂在 filesDir 下）仍按版本删。
+        // 两种都没有时按钮不该走到这里，兜一句日志免得静默。
+        if (instance == null && version == null) {
+            ui.log("❌ 当前没有可删除的实例")
+            return
+        }
+        val label = instance?.name ?: version!!
 
-        state.deletingVersion = version
+        stopForInstanceSettings("准备删除实例「$label」")
+
+        state.deletingVersion = label
         state.deleteProgress = 0f
         // 递归删上万个文件要几十秒，熄屏时不能被冻结在半截
-        EngineTaskService.start(this, "正在删除 dsh 引擎 $version")
+        EngineTaskService.start(this, "正在删除实例「$label」")
 
         Thread {
             // ── 先等停止流程走完 ────────────────────────────────────────────
@@ -340,18 +673,26 @@ class MainActivity : ComponentActivity() {
             }
             if (waited > 0) ui.log("⏹ 已等待实例退出 ${waited}ms，开始删除")
 
-            val ok = DSHRunner.deleteVersion(this, version) { p ->
-                runOnUiThread { state.deleteProgress = p }
+            val ok = if (instance != null) {
+                // 有实例：删整个实例目录（引擎 + HOME + 工作区 + 会话）
+                Instances.delete(this, instance.id) { p ->
+                    runOnUiThread { state.deleteProgress = p }
+                }
+            } else {
+                // 老部署：没有实例概念，仍按版本删
+                DSHRunner.deleteVersion(this, version!!) { p ->
+                    runOnUiThread { state.deleteProgress = p }
+                }
             }
             runOnUiThread {
                 state.deletingVersion = null
                 state.deleteProgress = 0f
-                // 删除会改变「已装版本」与当前指针，全部界面都要跟着刷新
+                // 删除会改变「当前实例」与版本指针，全部界面都要跟着刷新
                 state.refreshEngineVersion(this)
                 if (ok) {
-                    ui.log("✅ 已删除引擎 $version（含其独立数据目录）")
+                    ui.log("🗑 已删除实例「$label」（含引擎、工作区与会话）")
                 } else {
-                    ui.log("⚠️ 删除 $version 未完全成功，可能有文件仍被占用")
+                    ui.log("⚠️ 删除实例「$label」未完全成功，可能有文件仍被占用")
                 }
             }
         }.start()
@@ -594,29 +935,34 @@ class MainActivity : ComponentActivity() {
         rail.elevation = 8 * d
 
         // 1) 主界面 —— 收回当前面板（若没面板则什么都不做）
-        rail.addView(makeRailIcon(R.drawable.ic_rail_home, railW) {
+        //
+        // ⚠️ 这里**不能写 `context.`**。MainActivity 继承 ComponentActivity，
+        // 它本身就是 Context，但**没有**名为 `context` 的属性/方法 ——
+        // 裸写 `context` 会被解析成 Kotlin 标准库的顶层函数 `context(...)`，
+        // 报「Function invocation 'context(...)' expected」+「Unresolved reference」。
+        // 直接用 Activity 自己的成员（`packageName` / `resources`）即可。
+        val packageName = this.packageName
+        rail.addView(makeRailIcon(resources.getIdentifier("ic_rail_home", "drawable", packageName), railW) {
             if (ui.hasPanel) ui.closePanel() else hint("已经在主界面了")
         })
 
         // 2) 实例设置 —— dsh 设置 / 插件管理 / 会话管理 / mcp 管理 四个选项卡。
         // 导出整合包也在这一页的 dsh 设置里。
-        rail.addView(makeRailIcon(R.drawable.ic_rail_tools, railW) {
+        rail.addView(makeRailIcon(resources.getIdentifier("ic_rail_tools", "drawable", packageName), railW) {
             ui.openPanel(LauncherPanel.INSTANCE)
         })
 
         // 3) 下载中心。openPanel 会直接顶掉当前面板，不需要先关再开。
-        rail.addView(makeRailIcon(R.drawable.ic_rail_download, railW) {
+        rail.addView(makeRailIcon(resources.getIdentifier("ic_rail_download", "drawable", packageName), railW) {
             ui.openPanel(LauncherPanel.DOWNLOAD)
         })
 
-        // 4) 多人游戏 —— 按要求先占位，功能不做（FCL 对应 @id/multiplayer）。
-        // 给提示而不是静默：点下去毫无反应会让人以为界面卡住了。
-        rail.addView(makeRailIcon(R.drawable.ic_rail_multiplayer, railW) {
-            hint("多人游戏 · 暂未实现")
-        })
-
-        // 5) 启动器设置（选项卡：启动器设置 / 权限设置 / 关于）
-        rail.addView(makeRailIcon(R.drawable.ic_rail_settings, railW) {
+        // 4) 启动器设置（选项卡：启动器设置 / dsh 窗口 / 权限设置 / 关于）
+        //
+        // 这里原先有一个「多人游戏」占位图标，点下去只弹一句「暂未实现」。
+        // 正式版不留假按钮：功能不做就干脆不摆出来，否则用户会以为是自己
+        // 没找到入口。
+        rail.addView(makeRailIcon(resources.getIdentifier("ic_rail_settings", "drawable", packageName), railW) {
             ui.openPanel(LauncherPanel.SETTINGS)
         })
 
@@ -624,7 +970,7 @@ class MainActivity : ComponentActivity() {
         rail.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
 
         // 5) 退出 —— 有面板时只收回面板，没有面板才真正退出应用
-        rail.addView(makeRailIcon(R.drawable.ic_rail_exit, railW) {
+        rail.addView(makeRailIcon(resources.getIdentifier("ic_rail_exit", "drawable", packageName), railW) {
             if (ui.hasPanel) ui.closePanel() else exitLauncher()
         })
 
@@ -697,7 +1043,13 @@ class MainActivity : ComponentActivity() {
      */
     private fun applyRootBackground() {
         if (!::rootView.isInitialized) return
-        val res = if (Fcl.isDark) R.drawable.background_dark else R.drawable.background_light
+        // 同上：Activity 里没有 `context` 这个名字，直接用自己的成员。
+        val packageName = this.packageName
+        val res = resources.getIdentifier(
+            if (Fcl.isDark) "background_dark" else "background_light",
+            "drawable",
+            packageName
+        )
         val d = androidx.core.content.ContextCompat.getDrawable(this, res)
         if (d is android.graphics.drawable.BitmapDrawable) {
             d.gravity = Gravity.FILL
@@ -853,11 +1205,15 @@ class MainActivity : ComponentActivity() {
                 ExportProgressDialog()
             }
 
-            // 删除版本的进度小窗口。
-            // 删一个版本要递归删掉上万个文件，没有反馈就是个「点了没反应」的界面。
-            val deletingVersion = state.deletingVersion
-            if (deletingVersion != null) {
-                DeleteProgressDialog(version = deletingVersion, progress = state.deleteProgress)
+            // 删除实例的进度小窗口。
+            // 删一个实例要递归删掉上万个文件，没有反馈就是个「点了没反应」的界面。
+            //
+            // `state.deletingVersion` 这个字段名是历史遗留（以前删的是版本），
+            // 现在装的是**实例名**。字段名不改是为了避免牵动 LauncherState
+            // 与其它读取点，但窗口里的措辞必须按实例来说。
+            val deletingLabel = state.deletingVersion
+            if (deletingLabel != null) {
+                DeleteProgressDialog(label = deletingLabel, progress = state.deleteProgress)
             }
 
             // 导入整合包的进度小窗口。
@@ -872,14 +1228,17 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 删除版本的进度窗口。
+     * 删除实例的进度窗口。
      *
      * 与 [ExportProgressDialog] 的区别：这里**不给**取消按钮。
-     * 删到一半停下只会留下一个残缺的版本目录（引擎一半有一半没有），
+     * 删到一半停下只会留下一个残缺的实例目录（引擎一半有一半没有），
      * 反而比删完更难恢复，所以只能等它跑完。
+     *
+     * @param label 要删除的对象名字。现在传的是**实例名**；
+     *   老部署（无实例概念）下传的是版本号。
      */
     @Composable
-    private fun DeleteProgressDialog(version: String, progress: Float) {
+    private fun DeleteProgressDialog(label: String, progress: Float) {
         Dialog(
             // 不让外部点击/返回键关掉：删除无法安全中断
             onDismissRequest = { },
@@ -896,7 +1255,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 Column(modifier = Modifier.padding(18.dp)) {
                     Text(
-                        text = "正在删除 $version",
+                        text = "正在删除「$label」",
                         color = Fcl.TextPrimary,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Medium
@@ -905,7 +1264,7 @@ class MainActivity : ComponentActivity() {
                     Spacer(modifier = Modifier.height(4.dp))
 
                     Text(
-                        text = "引擎文件与它独立的数据目录正在被移除，请稍候。",
+                        text = "引擎、工作区与会话正在被移除，请稍候。",
                         color = Fcl.TextTertiary,
                         fontSize = 10.sp
                     )
@@ -1188,7 +1547,13 @@ class MainActivity : ComponentActivity() {
             // 不会跳回 0 或 1。
             if (anim != null) {
                 LaunchedEffect(p, shown) {
-                    anim.animateTo(if (shown) 1f else 0f, tween(PANEL_ANIM_MS))
+                    anim.animateTo(
+                        targetValue = if (shown) 1f else 0f,
+                        animationSpec = tween(
+                            durationMillis = PANEL_ANIM_MS,
+                            easing = PanelEasing
+                        )
+                    )
                 }
             }
         }
@@ -1219,7 +1584,35 @@ class MainActivity : ComponentActivity() {
                     state = state,
                     progress = progress[p]?.value ?: 0f,
                     gapPx = gapPx,
-                    onExportEngine = { requestEngineExport() }
+                    onExportEngine = { requestEngineExport() },
+                    onExportPlugins = { pluginExportLauncher.launch("dsh-plugins.zip") },
+                    onImportPlugins = { pluginImportLauncher.launch("application/zip") },
+                    onExportSessions = { sessionExportLauncher.launch("dsh-sessions.zip") },
+                    onImportSessions = { sessionImportLauncher.launch("application/zip") },
+                    onExportPlugin = { name ->
+                        pendingPluginExport = name
+                        singlePluginExportLauncher.launch(pluginZipName(name))
+                    },
+                    onExportSession = { key ->
+                        pendingSessionExport = key
+                        singleSessionExportLauncher.launch("session-$key.zip")
+                    },
+                    onExportSkills = { skillExportLauncher.launch("dsh-skills.zip") },
+                    onImportSkills = { skillImportLauncher.launch("application/zip") },
+                    onExportSkill = { id, label ->
+                        // 参数必须经字段带过 SAF 回调：启动是异步的，
+                        // lambda 捕获的栈在回调触发时早已不存在。
+                        pendingSkillExport = id to label
+                        singleSkillExportLauncher.launch("skill-$id.zip")
+                    },
+                    onExportMcp = { mcpExportLauncher.launch("dsh-mcp.zip") },
+                    onImportMcp = { mcpImportLauncher.launch("application/zip") },
+                    onExportMcpConfig = { rel ->
+                        pendingMcpExport = rel
+                        singleMcpExportLauncher.launch(
+                            "mcp-" + rel.substringAfterLast('/') + ".zip"
+                        )
+                    }
                 )
             }
             if (target != LauncherPanel.NONE) {
@@ -1228,7 +1621,35 @@ class MainActivity : ComponentActivity() {
                     state = state,
                     progress = progress[target]?.value ?: 0f,
                     gapPx = gapPx,
-                    onExportEngine = { requestEngineExport() }
+                    onExportEngine = { requestEngineExport() },
+                    onExportPlugins = { pluginExportLauncher.launch("dsh-plugins.zip") },
+                    onImportPlugins = { pluginImportLauncher.launch("application/zip") },
+                    onExportSessions = { sessionExportLauncher.launch("dsh-sessions.zip") },
+                    onImportSessions = { sessionImportLauncher.launch("application/zip") },
+                    onExportPlugin = { name ->
+                        pendingPluginExport = name
+                        singlePluginExportLauncher.launch(pluginZipName(name))
+                    },
+                    onExportSession = { key ->
+                        pendingSessionExport = key
+                        singleSessionExportLauncher.launch("session-$key.zip")
+                    },
+                    onExportSkills = { skillExportLauncher.launch("dsh-skills.zip") },
+                    onImportSkills = { skillImportLauncher.launch("application/zip") },
+                    onExportSkill = { id, label ->
+                        // 参数必须经字段带过 SAF 回调：启动是异步的，
+                        // lambda 捕获的栈在回调触发时早已不存在。
+                        pendingSkillExport = id to label
+                        singleSkillExportLauncher.launch("skill-$id.zip")
+                    },
+                    onExportMcp = { mcpExportLauncher.launch("dsh-mcp.zip") },
+                    onImportMcp = { mcpImportLauncher.launch("application/zip") },
+                    onExportMcpConfig = { rel ->
+                        pendingMcpExport = rel
+                        singleMcpExportLauncher.launch(
+                            "mcp-" + rel.substringAfterLast('/') + ".zip"
+                        )
+                    }
                 )
             }
         }
@@ -1246,7 +1667,19 @@ class MainActivity : ComponentActivity() {
         state: LauncherState,
         progress: Float,
         gapPx: Float,
-        onExportEngine: () -> Unit
+        onExportEngine: () -> Unit,
+        onExportPlugins: () -> Unit,
+        onImportPlugins: () -> Unit,
+        onExportSessions: () -> Unit,
+        onImportSessions: () -> Unit,
+        onExportPlugin: (String) -> Unit,
+        onExportSession: (String) -> Unit,
+        onExportSkills: () -> Unit,
+        onImportSkills: () -> Unit,
+        onExportSkill: (String, String) -> Unit,
+        onExportMcp: () -> Unit,
+        onImportMcp: () -> Unit,
+        onExportMcpConfig: (String) -> Unit
     ) {
         Box(
             modifier = Modifier
@@ -1263,7 +1696,19 @@ class MainActivity : ComponentActivity() {
                     tab = state.instanceTab,
                     onSelectTab = { state.instanceTab = it },
                     onExportEngine = onExportEngine,
-                    onDeleteVersion = { requestDeleteVersion(state) }
+                    onDeleteVersion = { requestDeleteInstance(state) },
+                    onExportPlugins = onExportPlugins,
+                    onImportPlugins = onImportPlugins,
+                    onExportSessions = onExportSessions,
+                    onImportSessions = onImportSessions,
+                    onExportPlugin = onExportPlugin,
+                    onExportSession = onExportSession,
+                    onExportSkills = onExportSkills,
+                    onImportSkills = onImportSkills,
+                    onExportSkill = onExportSkill,
+                    onExportMcp = onExportMcp,
+                    onImportMcp = onImportMcp,
+                    onExportMcpConfig = onExportMcpConfig
                 )
 
                 LauncherPanel.DOWNLOAD -> DownloadPanel(
@@ -1282,9 +1727,34 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * 版本管理面板里的一行。
+     *
+     * 把「实例」与「老部署的版本号」两种来源归一成同一种可选项，
+     * 下面那块列表因此只需要一份渲染代码 —— 两者的切换动作虽然不同，
+     * 但已经收进 [onPick] 里了。
+     */
+    private data class VersionPickRow(
+        /** 切换时用的键：实例 id，或老部署的版本号。 */
+        val key: String,
+        val title: String,
+        val subtitle: String,
+        val isCurrent: Boolean,
+        /** 是否用等宽字体（版本号用，实例名不用）。 */
+        val mono: Boolean,
+        /**
+         * 副行是否该用警示色。
+         *
+         * 目前没有任何调用点会传 true —— 「引擎未安装」那类提示已从界面移除，
+         * 保留这个字段只是为了不改动既有渲染代码。
+         */
+        val warn: Boolean = false,
+        val onPick: () -> Unit
+    )
+
+    /**
      * 版本管理小窗口。
      *
-     * 职责只有两件：**显示已安装版本**、**选择使用哪个版本**。
+     * 职责只有两件：**列出全部实例**、**选择下次「启动」用哪个实例**。
      * 不做删除、导入、重命名 —— 那些属于下载中心的范畴。
      *
      * ## 为什么用小窗口而不是全屏面板
@@ -1307,13 +1777,96 @@ class MainActivity : ComponentActivity() {
     private fun VersionManagerPanel(state: LauncherState, onClose: () -> Unit) {
         val context = LocalContext.current
 
-        // 已装版本列表：打开面板时扫一次磁盘；切换/装完后 tick++ 重扫。
+        // 实例列表：打开面板时扫一次磁盘；切换/装完后 tick++ 重扫。
+        //
+        // ## ★ 必须列**实例**，不能列版本 ★
+        //
+        // 原先扫的是 `usr/lib/versions` 下的目录名 —— 那就是版本号。
+        // 同一个版本装了两个实例时，列表里只有一行、显示的还只是版本号：
+        // 用户看不出自己有两个实例，也根本选不到第二个。
+        //
+        // 实例才是用户认知里的对象（他给实例起了名字），版本只是实例的一个属性。
         var tick by remember { mutableStateOf(0) }
-        val installedVersions = remember(tick) { DSHRunner.installedVersions(context) }
+        val instances = remember(tick) { Instances.list(context) }
+        val activeId = remember(tick) { Instances.activeId(context) }
+        val activeInstance = instances.firstOrNull { it.id == activeId }
+
+        // 升级前的老部署没有实例，数据仍在 filesDir/home 与 filesDir/usr 下。
+        // 那种情况回落到按版本列出，否则面板会一片空白、用户以为数据丢了。
+        val legacyVersions = remember(tick) {
+            if (instances.isEmpty()) DSHRunner.installedVersions(context) else emptyList()
+        }
 
         // 「当前使用中」直接读共享状态，切换后面板与主页卡片同时重组。
         val current = state.engineVersion
-        val installed = current != null
+        val installed = activeInstance?.installed == true ||
+            (instances.isEmpty() && current != null)
+
+        // 归一成一组可选项：有实例就列实例，老部署才列版本号。
+        //
+        // 刻意**不用 remember** 包起来：这里只有几个元素，每次重组重算的代价
+        // 可以忽略，而 remember 会把 `state.runState` 之类的快照过期掉 ——
+        // 那正是「点切换没反应」这类 bug 的来源。
+        val rows: List<VersionPickRow> = if (instances.isNotEmpty()) {
+            instances.map { inst ->
+                VersionPickRow(
+                    key = inst.id,
+                    title = inst.name,
+                    subtitle = buildString {
+                        // 只写出真实存在的版本号；不再显示「未装引擎」这类提示。
+                        if (inst.version.isNotBlank()) append("引擎 ${inst.version}")
+                        if (inst.id == activeId) {
+                            if (isNotEmpty()) append(" · 当前") else append("当前")
+                        }
+                    },
+                    isCurrent = inst.id == activeId,
+                    // 实例名可能有中文，不套等宽字体
+                    mono = false,
+                    onPick = {
+                        if (inst.id != activeId) {
+                            // 只写指针，真正换进程在下次「启动」；
+                            // 若此刻正在运行，则按新实例重启（同一时刻只跑一个）。
+                            Instances.setActive(context, inst.id)
+                            state.refreshEngineVersion(context)
+                            tick++
+                            if (!inst.installed) {
+                                // 保持原控制流不变（不装引擎时不重启）：
+                                // 只把「还没有装引擎」这句话从提示里去掉了。
+                                state.log("✅ 已切换到「${inst.name}」")
+                            } else if (state.runState.isAlive) {
+                                state.log("🔄 已切换到「${inst.name}」，正在重启实例…")
+                                restartInstance(state)
+                            } else {
+                                state.log("✅ 已切换到「${inst.name}」，下次启动时生效")
+                            }
+                        }
+                    }
+                )
+            }
+        } else {
+            legacyVersions.map { v ->
+                VersionPickRow(
+                    key = v,
+                    title = v,
+                    subtitle = if (v == current) "当前使用中" else "旧版单实例布局 · 点此切换",
+                    isCurrent = v == current,
+                    mono = true,
+                    onPick = {
+                        if (v != current) {
+                            DSHRunner.setCurrentVersion(context, v)
+                            state.refreshEngineVersion(context)
+                            tick++
+                            if (state.runState.isAlive) {
+                                state.log("🔄 已切换到 $v，正在重启实例…")
+                                restartInstance(state)
+                            } else {
+                                state.log("✅ 已切换到 $v，下次启动时生效")
+                            }
+                        }
+                    }
+                )
+            }
+        }
 
         // 打开面板先与磁盘对齐一次（别处可能改过指针）
         LaunchedEffect(Unit) { state.refreshEngineVersion(context) }
@@ -1364,13 +1917,26 @@ class MainActivity : ComponentActivity() {
                         Spacer(modifier = Modifier.width(8.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = current ?: "未安装任何版本",
+                                // 有实例时显示**实例名** —— 那是用户自己起的、认得出来的名字。
+                                // 没有实例的老部署才回落到版本号，此时版本号确实是它的标识。
+                                text = activeInstance?.name
+                                    ?: current
+                                    ?: "还没有实例",
                                 color = if (installed) Fcl.TextPrimary else Fcl.TextSecondary,
                                 fontSize = 12.sp,
-                                fontFamily = FontFamily.Monospace
+                                // 实例名可能有中文，不套等宽字体；老部署的版本号仍然用等宽
+                                fontFamily = if (activeInstance != null) null
+                                else FontFamily.Monospace
                             )
                             Text(
-                                text = if (installed) "当前使用中" else "请先到下载中心安装",
+                                text = when {
+                                    activeInstance != null &&
+                                        activeInstance.version.isNotBlank() ->
+                                        "当前实例 · 引擎 ${activeInstance.version}"
+                                    activeInstance != null -> "当前实例"
+                                    installed -> "当前使用中（旧版单实例布局）"
+                                    else -> "请先到下载中心安装"
+                                },
                                 color = Fcl.TextTertiary,
                                 fontSize = 9.sp
                             )
@@ -1380,8 +1946,8 @@ class MainActivity : ComponentActivity() {
                     Spacer(modifier = Modifier.height(12.dp))
                     HorizontalDivider(color = Fcl.Line)
 
-                    // ── 已安装版本列表 ──────────────────────────────────
-                    if (installedVersions.isEmpty()) {
+                    // ── 实例列表（老部署回落到版本列表）──────────────────
+                    if (rows.isEmpty()) {
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1389,7 +1955,7 @@ class MainActivity : ComponentActivity() {
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Text(
-                                text = "暂无已安装版本",
+                                text = "还没有实例",
                                 color = Fcl.TextSecondary,
                                 fontSize = 11.sp
                             )
@@ -1406,38 +1972,22 @@ class MainActivity : ComponentActivity() {
                                 .fillMaxWidth()
                                 .heightIn(max = 220.dp)
                         ) {
-                            itemsIndexed(installedVersions) { idx, v ->
-                                val isCurrent = v == current
-
+                            itemsIndexed(rows) { idx, row ->
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        // 点一下即切换：写指针 +（运行中就重启）。
-                                        // 已在用的那版点了不做任何事，避免无谓重启。
+                                        // 点一下即切换。已在用的那个点了不做任何事，避免无谓重启。
                                         //
                                         // ★ 切换后**不关闭弹窗** ★
                                         // 之前这里紧跟一句 onClose()，用户点完窗口就没了、
                                         // 再打开才看到结果，观感上就是「点了没反应、版本不会变」。
                                         // 现在留在原地让选中态立刻移动，用户自己关。
-                                        .fclClickable {
-                                            if (isCurrent) return@fclClickable
-                                            DSHRunner.setCurrentVersion(context, v)
-                                            // 先刷新共享状态：面板与主页卡片一起更新
-                                            state.refreshEngineVersion(context)
-                                            tick++
-                                            val wasAlive = state.runState.isAlive
-                                            if (wasAlive) {
-                                                state.log("🔄 已切换到 $v，正在重启实例…")
-                                                restartInstance(state)
-                                            } else {
-                                                state.log("✅ 已切换到 $v，下次启动时生效")
-                                            }
-                                        }
+                                        .fclClickable { row.onPick() }
                                         .padding(vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     RadioButton(
-                                        selected = isCurrent,
+                                        selected = row.isCurrent,
                                         // 整行已有点击，这里传 null 避免双重触发；
                                         // 但不再置 enabled=false —— 禁用态会让整行看着点不动。
                                         onClick = null,
@@ -1449,22 +1999,34 @@ class MainActivity : ComponentActivity() {
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
-                                            text = v,
-                                            color = if (isCurrent) Fcl.Success
+                                            text = row.title,
+                                            color = if (row.isCurrent) Fcl.Success
                                             else Fcl.TextPrimary,
                                             fontSize = 12.sp,
-                                            fontFamily = FontFamily.Monospace
+                                            // 实例名可以是中文，只有版本号才用等宽；
+                                            // 传 null 表示用主题默认字体
+                                            fontFamily = if (row.mono) FontFamily.Monospace
+                                            else null,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
                                         )
                                         Text(
-                                            text = if (isCurrent) "当前使用中" else "点此切换",
-                                            color = if (isCurrent) Fcl.Success
-                                            else Fcl.TextTertiary,
-                                            fontSize = 9.sp
+                                            text = row.subtitle,
+                                            // 警示优先于选中态：当前实例若没装引擎，
+                                            // 副行必须是红的，绿色会被读成「一切正常」。
+                                            color = when {
+                                                row.warn -> Fcl.Danger
+                                                row.isCurrent -> Fcl.Success
+                                                else -> Fcl.TextTertiary
+                                            },
+                                            fontSize = 9.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
                                         )
                                     }
                                 }
 
-                                if (idx < installedVersions.size - 1) {
+                                if (idx < rows.size - 1) {
                                     HorizontalDivider(color = Fcl.Divider)
                                 }
                             }
@@ -1474,8 +2036,8 @@ class MainActivity : ComponentActivity() {
                     Spacer(modifier = Modifier.height(10.dp))
 
                     Text(
-                        text = "切换版本会立即写盘；若 dsh 正在运行会自动重启到新版本。" +
-                            "同一时刻只运行一个实例。",
+                        text = "切换会立即写盘；若 dsh 正在运行会自动重启到所选实例。" +
+                            "同一时刻只运行一个实例，各实例的引擎、工作区与会话互相独立。",
                         color = Fcl.TextTertiary,
                         fontSize = 9.sp,
                         lineHeight = 13.sp
@@ -1947,27 +2509,118 @@ class MainActivity : ComponentActivity() {
 
                     if (tab == 3) {
                         // ── 关于 ────────────────────────────────────────────
-                        FclSettingSection("关于")
+                        //
+                        // 版本号从 PackageManager 现取，不写死在代码里：
+                        // build.gradle.kts 改版本后这里自动跟着变，
+                        // 免得发版时忘了同步、用户报 bug 时报了个旧版本号。
+                        val pkgInfo = remember {
+                            runCatching {
+                                context.packageManager
+                                    .getPackageInfo(context.packageName, 0)
+                            }.getOrNull()
+                        }
+                        val versionName = pkgInfo?.versionName ?: "未知"
+
+                        FclSettingSection("应用")
                         FclSettingRow(
                             label = "DSH Launcher",
-                            description = "FCL 风格的 dsh 启动器",
+                            description = "把 dsh 完整搬到手机上运行，界面版式参照 FCL。",
                             shape = RowShape.TOP
                         ) {
                             Text(
-                                text = "com.example.fcldsh",
-                                color = Fcl.TextTertiary,
-                                fontSize = 11.sp
+                                text = "v$versionName",
+                                color = Fcl.ThemeText,
+                                fontSize = 12.sp
                             )
                         }
                         FclSettingRow(
-                            label = "容器",
-                            description = "Node 运行时随应用内置，无需联网下载。",
+                            label = "包名",
+                            shape = RowShape.BOTTOM
+                        ) {
+                            Text(
+                                text = context.packageName,
+                                color = Fcl.TextTertiary,
+                                fontSize = 10.sp
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        FclSettingSection("开发者")
+                        FclSettingRow(
+                            label = "夜ksy",
+                            description = "问题反馈、功能建议、安装遇到卡点，都可以通过下面任一渠道找。",
+                            shape = RowShape.TOP
+                        ) {
+                            Text(
+                                text = "开发",
+                                color = Fcl.Success,
+                                fontSize = 10.sp
+                            )
+                        }
+                        // 三行联系方式的文本都可长按复制 —— 数字串让用户手抄
+                        // 是不现实的，而 qq 群号又不能直接点开（要额外权限）。
+                        FclSettingRow(
+                            label = "B 站",
+                            description = "视频演示与更新说明",
                             shape = RowShape.MIDDLE
+                        ) {
+                            Text(
+                                text = "夜ksy",
+                                color = Fcl.ThemeText,
+                                fontSize = 12.sp
+                            )
+                        }
+                        FclSettingRow(
+                            label = "QQ",
+                            description = "一对一反馈",
+                            shape = RowShape.MIDDLE
+                        ) {
+                            Text(
+                                text = "2676196492",
+                                color = Fcl.ThemeText,
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                        FclSettingRow(
+                            label = "QQ 群",
+                            description = "使用交流与版本发布",
+                            shape = RowShape.BOTTOM
+                        ) {
+                            Text(
+                                text = "139235410",
+                                color = Fcl.ThemeText,
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        FclSettingSection("组成")
+                        FclSettingRow(
+                            label = "容器",
+                            description = "Node 运行时随应用内置，首次启动自动解压，无需联网下载。",
+                            shape = RowShape.TOP
                         )
                         FclSettingRow(
                             label = "引擎",
-                            description = "dsh 在下载中心单独安装，可随版本升级。",
+                            description = "dsh 本体在下载中心单独安装。多版本可共存，" +
+                                "各自一套数据目录，互不相通。",
+                            shape = RowShape.MIDDLE
+                        )
+                        FclSettingRow(
+                            label = "界面",
+                            description = "Kotlin + Jetpack Compose 手写。",
                             shape = RowShape.BOTTOM
+                        )
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        FclSettingSection("致谢")
+                        FclSettingRow(
+                            label = "参考项目",
+                            description = "界面版式参考 Fold Craft Launcher；" +
+                                "容器与插件布局参考 Deepseek-Harness-Local-Android。",
+                            shape = RowShape.SINGLE
                         )
                     }
                 }
@@ -2031,7 +2684,7 @@ class MainActivity : ComponentActivity() {
                 // 统一用盾牌图标，靠 tint 区分状态 ——
                 // 扁平风格下颜色+文字比换图标更容易扫读。
                 Image(
-                    painter = painterResource(id = R.drawable.ic_perm_shield),
+                    painter = painterResource(id = LocalContext.current.resources.getIdentifier("ic_perm_shield", "drawable", LocalContext.current.packageName)),
                     contentDescription = null,
                     colorFilter = ColorFilter.tint(color),
                     modifier = Modifier.size(18.dp)
@@ -2111,6 +2764,18 @@ class MainActivity : ComponentActivity() {
         // 记住上次页签反而会让人以为面板没被重置。
         var tab by remember { mutableStateOf(DownloadTab.DSH) }
 
+        // 待命名的安装目标版本。非空时弹出「实例命名」小窗 ——
+        // 同一个版本可以建多个实例，所以点「下载」不能直接开工，
+        // 必须先确定这次要装成哪个实例（否则会默认覆盖已有实例）。
+        var pendingInstallVersion by remember { mutableStateOf<String?>(null) }
+
+        // 安装 / 建实例之后的刷新触发器。
+        //
+        // 实例的增删改都直接改文件，不经过任何 Compose 状态；
+        // 自增它能让依赖它的读取重新读盘。下载中心**不再做实例管理**
+        // （列实例、改名、删除都归「实例设置」），所以这里只剩安装路径在用。
+        var instanceTick by remember { mutableStateOf(0) }
+
         // 导出流程的状态由整合包页签订阅（导入/导出已搬到那边），
         // 这里不再读，避免 dsh 页因为无关的打包任务而重组。
 
@@ -2163,7 +2828,9 @@ class MainActivity : ComponentActivity() {
                             .fillMaxWidth()
                             .weight(1f)
                             .verticalScroll(rememberScrollState())
-                            .padding(20.dp)
+                            // 20dp 收到 12dp：与插件下载页保持同一套外距，
+                            // 两个页签切换时内容左边不会跳位置
+                            .padding(12.dp)
                     ) {
                     // ── 引擎说明 ────────────────────────────────────────
                     // 照 FCL 的 bg_container_white：纯白卡片 + 8dp 圆角。
@@ -2276,30 +2943,16 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
 
-                                    // 「浏览器」：跳到该版本的下载页，只负责把包存到本地，
-                                    // 不安装、也不检查是否已下载（重名会在那边自动改名）。
-                                    // 放在「下载」左边，因为它是更轻量的动作。
-                                    TextButton(
-                                        onClick = {
-                                            DshDownloadPageActivity.open(context, v)
-                                        },
-                                        contentPadding = PaddingValues(
-                                            horizontal = 8.dp, vertical = 4.dp
-                                        )
-                                    ) {
-                                        Text(
-                                            text = "浏览器",
-                                            fontSize = 11.sp,
-                                            color = Fcl.TextSecondary
-                                        )
-                                    }
-
                                     // 每行独立的下载按钮：点哪行装哪版，
                                     // 不再需要"先选中再安装"两步操作。
+                                    //
+                                    // 点下去先弹「实例命名」小窗（见 InstanceNameDialog）：
+                                    // 同一个版本可以建多个实例，必须先确定名字，
+                                    // 否则会默认覆盖掉已有实例。
                                     TextButton(
                                         onClick = {
                                             EngineInstaller.selectedVersion = v
-                                            EngineInstaller.installVersion(context, v)
+                                            pendingInstallVersion = v
                                         },
                                         enabled = !busy,
                                         contentPadding = PaddingValues(
@@ -2330,17 +2983,13 @@ class MainActivity : ComponentActivity() {
 
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    // 「从本地 zip 安装」与「导出已安装引擎」已按需求搬到
-                    // 整合包下载页签（见 DownloadCenter.kt 的 DownloadBrowseTab）。
-                    // dsh 页只留引擎状态 + 版本列表。
-
                     Spacer(modifier = Modifier.height(16.dp))
                     HorizontalDivider(color = Fcl.Divider)
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Text(
-                        text = "点版本行右侧的「下载」即可安装。" +
-                            "「浏览器」只把该版本的包下载到本地，不安装、也不检查是否已下载。" +
+                        text = "点版本行右侧的「下载」即可安装，安装前会让你给实例起个名字。" +
+                            "同一版本可以建多个实例，各自装一份引擎、各自一套工作区与会话，互不相通。" +
                             "安装完成后回到主界面点「启动」。" +
                             "若安装失败，可在主界面齿轮处打开运行日志查看具体原因。",
                         color = Fcl.TextTertiary,
@@ -2348,8 +2997,53 @@ class MainActivity : ComponentActivity() {
                         lineHeight = 15.sp
                     )
                     }
+                } else if (tab == DownloadTab.PLUGIN) {
+                    // 插件下载：接了真实数据（插件市场索引 → 装进当前实例）。
+                    //
+                    // ★ 这里必须给成有界高度，不能套 verticalScroll ★
+                    //
+                    // PluginDownloadPanel 内部是「左 1/3 + 右 2/3」两栏，
+                    // 靠 weight 分宽度、靠 fillMaxHeight 分高度。外面若再包一层
+                    // verticalScroll，高度约束会变成无限，两栏塌成内容高度、
+                    // 分栏直接立不起来（实例设置页踩过同一个坑）。
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                    ) {
+                        PluginDownloadPanel()
+                    }
+                } else if (tab == DownloadTab.SKILL) {
+                    // skill 下载：走「粘链接安装」，不复用插件那套翻页列表 ——
+                    // skill 没有统一的版本索引可拉，硬套只会得到一个空列表。
+                    //
+                    // 同样必须给有界高度（两栏布局），不能套 verticalScroll。
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                    ) {
+                        SkillDownloadPanel(
+                            onImport = {
+                                skillImportLauncher.launch("application/zip")
+                            }
+                        )
+                    }
+                } else if (tab == DownloadTab.MCP) {
+                    // MCP 下载：本质是「注册表入口 + 导入」，理由见该面板的注释。
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                    ) {
+                        McpDownloadPanel(
+                            onImport = {
+                                mcpImportLauncher.launch("application/zip")
+                            }
+                        )
+                    }
                 } else {
-                    // 整合包 / 插件 / skill / mcp：版式照 FCL 的 page_download.xml。
+                    // 整合包：版式照 FCL 的 page_download.xml。
                     // 右侧是空态（尚未接入下载源），假列表与假按钮已按需求去掉。
                     DownloadBrowseTab(
                         tab = tab,
@@ -2357,6 +3051,35 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
+        }
+
+        // ── 安装：直接开工，不再让用户起名字 / 确认 ──────────────────────
+        //
+        // 部署的标识就是**版本号本身**（`usr/lib/versions/` 下的目录名）。
+        // 同一个版本装第二次时，Instances.allocateVersion 会自动加后缀
+        // （`0.2.1` → `0.2.1-2`），所以既不需要用户干预，也不会覆盖已有部署。
+        val pending = pendingInstallVersion
+        if (pending != null) {
+            pendingInstallVersion = null
+            EngineInstaller.selectedVersion = pending
+            EngineInstaller.installVersion(context, pending)
+        }
+
+        // ── 本地包：同样直接开工 ────────────────────────────────────────
+        //
+        // 流要现开现用：不提前打开，避免「选完文件后放置太久」失效。
+        val localZip = pendingLocalZip
+        if (localZip != null) {
+            pendingLocalZip = null
+            val stream = runCatching {
+                context.contentResolver.openInputStream(localZip)
+            }.getOrNull()
+            if (stream != null) {
+                DshEngineDownloader.installFrom(context, stream, "本地引擎包")
+            }
+            // 读不到文件时不做任何改动：列表里不会留下半个部署，
+            // 因为版本目录是解压成功之后才出现的。
+            instanceTick++
         }
 
         // ── 居中模态进度窗 ──────────────────────────────────────────────
@@ -2426,7 +3149,7 @@ class MainActivity : ComponentActivity() {
                 shape = RoundedCornerShape(Fcl.Radius),
                 color = Fcl.DialogBg
             ) {
-                Column(modifier = Modifier.padding(20.dp)) {
+                Column(modifier = Modifier.padding(14.dp)) {
                     Text(
                         text = when (phase) {
                             EngineInstaller.InstallPhase.INSTALLING -> "正在安装"
@@ -2515,6 +3238,161 @@ class MainActivity : ComponentActivity() {
                             OutlinedButton(onClick = onCancel) { Text("取消安装") }
                         } else {
                             TextButton(onClick = onDismiss) { Text("关闭") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 安装前给实例命名的小窗。
+     *
+     * ## 为什么要弹这一步
+     *
+     * 同一个 dsh 版本可以建多个实例，每个实例装一份引擎、一套 HOME 与工作区，
+     * 互不相通。若点「下载」就直接开工，第一个实例会被第二个悄悄覆盖 ——
+     * 用户看到的是「装完了，但上一个实例里聊的东西不见了」。
+     * 所以命名是安装的必要前置，不是可选步骤。
+     *
+     * ## 默认名与重名后缀
+     *
+     * 默认名取 `dsh-<版本>`。若已被占用，[Instances.suggestName] 会直接给出
+     * 带后缀的可用名（`dsh-0.2.1-2`、`-3`…），所以**用户什么都不改也能按确定** ——
+     * 这正是需求说的「提前发现有同名实例时，默认名称会自动加后缀」。
+     *
+     * 用户手工把名字改成另一个已存在的实例时，**确定也不会被拦**：同样自动
+     * 加后缀。实例的标识只有名称，所以重名意味着「再并存一个」而不是
+     * 「覆盖原来那个」；下载同一版本、反复从本地装同一个包都靠这条路径
+     * 实现同版本共存。「名称为空」才拦。
+     *
+     * ## 为什么 onConfirm 返回 String?
+     *
+     * 建目录/写元数据可能失败（磁盘满、权限）。返回非空字符串表示失败原因，
+     * 窗口保持打开并把原因显示出来；返回 null 表示成功，由调用方关窗。
+     * 若只返回 Unit，失败时窗口已经关掉，用户就只剩一句日志可看。
+     *
+     * @param version 要安装的引擎版本号；从 registry 下载时是确切版本。
+     * @param nameBase 默认名的基名。默认 `dsh-<版本>`；从本地 zip 安装时
+     *   选择那一刻还读不到版本号（要解析包内 package.json），所以调用方传
+     *   `dsh`，等装完由安装器把真实版本回写进实例元数据。
+     * @param versionHint 描述里那句「这是哪个版本」。本地包传一句说明，
+     *   避免显示成「引擎版本 本地安装包」这种不通的话。
+     * @param onConfirm 传入选定的名字；返回 null 表示已创建成功。
+     */
+    @Composable
+    private fun InstanceNameDialog(
+        version: String,
+        onDismiss: () -> Unit,
+        onConfirm: (String) -> String?,
+        nameBase: String = "dsh-$version",
+        versionHint: String = "引擎版本 $version。"
+    ) {
+        val context = LocalContext.current
+
+        // 默认名按基名算一次。用 remember(nameBase) 而不是 remember：
+        // 同一个小窗被复用于另一个版本（或另一条安装路径）时，
+        // 默认名必须跟着换，否则会把上一次算出来的残留名带过去。
+        val baseName = nameBase
+        // 命名窗已不再被任何调用点使用：安装改为按「版本号 + 自动后缀」分配目录名，
+        // 不需要用户起名字。这里保留最小实现，只为不打断既有渲染代码。
+        val autoRenamed = false
+        var name by remember(baseName) { mutableStateOf(baseName) }
+        var error by remember(baseName) { mutableStateOf<String?>(null) }
+
+        Dialog(
+            onDismissRequest = onDismiss,
+            properties = DialogProperties(
+                dismissOnBackPress = true,
+                dismissOnClickOutside = true,
+                usePlatformDefaultWidth = false
+            )
+        ) {
+            Surface(
+                modifier = Modifier.width(340.dp),
+                shape = RoundedCornerShape(Fcl.Radius),
+                color = Fcl.DialogBg
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text(
+                        text = "给实例命名",
+                        color = Fcl.TextPrimary,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Text(
+                        text = versionHint +
+                            "同一版本可以建多个实例，各自一套引擎、工作区与会话，互不相通。",
+                        color = Fcl.TextSecondary,
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = {
+                            name = it
+                            // 用户一动手就把上次的报错清掉，避免红色提示一直挂着
+                            error = null
+                        },
+                        singleLine = true,
+                        isError = error != null,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    // 自动加过后缀就明说一句，否则用户会以为默认名本来就长这样
+                    if (autoRenamed && error == null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "已存在同名实例，默认名已自动加后缀。",
+                            color = Fcl.TextTertiary,
+                            fontSize = 10.sp,
+                            lineHeight = 14.sp
+                        )
+                    }
+
+                    if (error != null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = error!!,
+                            color = Fcl.Danger,
+                            fontSize = 10.sp,
+                            lineHeight = 14.sp
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = onDismiss) { Text("取消") }
+                        Spacer(modifier = Modifier.width(4.dp))
+                        // 只有「名称为空」才拦。重名不拦 —— 见下面的说明。
+                        TextButton(
+                            onClick = {
+                                val clean = name.trim()
+                                if (clean.isEmpty()) {
+                                    error = "名称不能为空"
+                                    return@TextButton
+                                }
+                                // ★ 重名自动追加后缀，不再报错 ★
+                                //
+                                // 实例的标识只有名称，所以撞名意味着「再并存一个」，
+                                // 而不是「覆盖原来那个」：下载同一个版本、或反复从
+                                // 本地安装同一个包，正是要这样多开几个实例。
+                                // [Instances.create] 内部也做了同样的处理，这里先算一次
+                                // 是为了把最终名字交给 onConfirm —— 调用方用它切当前实例。
+                                error = onConfirm(clean)
+                            }
+                        ) {
+                            Text("确定", color = Fcl.ThemeText)
                         }
                     }
                 }
@@ -2636,9 +3514,10 @@ class MainActivity : ComponentActivity() {
 
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        // 未安装时明确说"未安装"，而不是显示一个根本不存在的版本号
-                        text = shownVersion ?: "未安装引擎",
-                        color = if (shownVersion != null) Fcl.TextPrimary else Fcl.Danger,
+                        // 不再显示「未安装引擎」这类提示：有版本号就写版本号，
+                        // 没有就留一个中性占位。
+                        text = shownVersion ?: "—",
+                        color = if (shownVersion != null) Fcl.TextPrimary else Fcl.TextSecondary,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
                         maxLines = 1

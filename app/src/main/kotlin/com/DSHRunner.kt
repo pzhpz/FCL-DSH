@@ -3,8 +3,10 @@ package com
 import android.content.Context
 import android.os.Build
 import com.example.fcldsh.AgentGuide
+import com.example.fcldsh.Instances
 import com.example.fcldsh.LauncherPrefs
 import com.example.fcldsh.PermissionMode
+import com.example.fcldsh.SandboxBackend
 import java.io.File
 import java.io.FileOutputStream
 import java.net.InetSocketAddress
@@ -17,9 +19,73 @@ object DSHRunner {
     var onLog: (String) -> Unit = {}
     var onUrlReady: (String) -> Unit = {}
 
+    /**
+     * 进程退出回调。**在后台线程被调用**，调用方自己 post 到主线程。
+     *
+     * ## 为什么必须存在
+     *
+     * 之前启动失败的收场是这样的：stdout 循环读到流关闭退出，只写一行日志
+     * 「Node 输出流已关闭（进程已退出）」，**没有任何状态回调**。
+     * 而 runState 是 startInstance() 在起进程之前置成 STARTING 的 ——
+     * 于是进程已经崩了，界面还停在「启动中」，永远不会自己恢复。
+     *
+     * 症状就是「点启动，一直转圈」，用户既看不到失败原因，也没法再点启动
+     *（STARTING 被当成存活状态，按钮会挡掉重复点击）。
+     *
+     * @param intentional 是否由用户主动停止（[stopProcess]）导致。
+     *   false 表示进程自己退了 —— 那就是崩溃，界面要切到 ERROR。
+     * @param exitCode 退出码；拿不到时是 null。
+     */
+    var onExited: ((intentional: Boolean, exitCode: Int?) -> Unit)? = null
+
     /** 当前 Node 进程。阶段一只是个单例句柄，阶段三会随实例一起管理。 */
     @Volatile
     private var process: Process? = null
+
+    /**
+     * 是否正处于「用户主动停止」流程中。
+     *
+     * 用来区分两种退出：用户点了停止/重启/删实例，还是 Node 自己崩了。
+     * 前者界面应回到「已停止」，后者应显示「异常」并给出原因 ——
+     * 两者都用同一句「进程已退出」的话会让用户以为是自己点错了。
+     *
+     * 置位在 [stopProcess]，复位在 [startNode] 起新进程时：
+     * 不能在这里一返回就复位，因为读流的线程是异步收尾的，
+     * 复位太早会把「主动停止」误判成「崩溃」。
+     */
+    @Volatile
+    private var stopping = false
+
+    /** [recentOutput] 的条数上限。够放下一个堆栈的前几行即可。 */
+    private const val RECENT_LIMIT = 60
+
+    /** 最近若干行输出（stdout + stderr 合流），崩溃时用来告诉用户原因。 */
+    private val recentOutput = ArrayList<String>(RECENT_LIMIT)
+
+    /**
+     * 记一行输出，环形丢弃最旧的。
+     *
+     * 名字刻意**不叫** `remember`：那会和 Compose 的
+     * `androidx.compose.runtime.remember` 撞名，编译器会把它解析成
+     * `@Composable` 那个版本，报「@Composable invocation can only happen
+     * from the context of a @Composable function」。
+     */
+    private fun rememberOutput(line: String) {
+        synchronized(recentOutput) {
+            recentOutput.add(line)
+            while (recentOutput.size > RECENT_LIMIT) recentOutput.removeAt(0)
+        }
+    }
+
+    /**
+     * 最近 [n] 行输出，最旧的在前。
+     *
+     * 给界面用：启动失败时把最后几行贴进日志，用户就不必自己去翻几百行 ERR。
+     */
+    fun recentLines(n: Int): List<String> = synchronized(recentOutput) {
+        val from = (recentOutput.size - n).coerceAtLeast(0)
+        recentOutput.subList(from, recentOutput.size).toList()
+    }
 
     /** 当前实例实际监听的端口。0 表示未启动。 */
     @Volatile
@@ -49,6 +115,10 @@ object DSHRunner {
             if (port != 0) onLog("   （上次记录的端口 $port 将自动避开）")
             return
         }
+
+        // 先置位再 destroy：读流的线程可能在我们 waitFor 期间就收尾了，
+        // 那时它要能读到 true，才不会把「用户主动停止」误报成崩溃。
+        stopping = true
 
         runCatching { p.destroy() }
 
@@ -379,7 +449,8 @@ object DSHRunner {
         pb.redirectErrorStream(true)
         pb.environment().apply {
             put("PREFIX", usr.absolutePath)
-            put("HOME", appHomeDir(context).absolutePath)
+            // 跟着实例走：npm / node 的 HOME 必须和它将要写入的那份数据同源
+            put("HOME", instanceHome(context).absolutePath)
             put("TMPDIR", File(context.cacheDir, "tmp").apply { mkdirs() }.absolutePath)
             put("LD_LIBRARY_PATH", File(usr, "lib").absolutePath)
             put("PATH", "${File(usr, "bin").absolutePath}:/system/bin")
@@ -537,7 +608,26 @@ object DSHRunner {
 
     private fun usrDir(context: Context) = File(context.filesDir, USR)
 
-    private fun versionsRoot(context: Context) = File(usrDir(context), VERSIONS_REL)
+    /**
+     * 引擎版本根目录：`filesDir/usr/lib/versions`。
+     *
+     * 不再按实例嵌套 —— 每个版本就是这里的一个子目录，目录名即「版本键」
+     * （同版本并存时带 `-2` 后缀，见 [Instances.allocateVersion]）。
+     */
+    private fun versionsRoot(context: Context): File =
+        File(usrDir(context), VERSIONS_REL)
+
+    /**
+     * 对外的版本根目录。
+     *
+     * [EngineInstaller] 也要往这里落盘；它不能自己拼 `filesDir/usr/lib/versions`，
+     * 否则实例模式下会把引擎装进老路径 —— 那个目录当前实例根本不看。
+     */
+    fun versionsDir(context: Context): File {
+        val root = versionsRoot(context)
+        root.mkdirs()
+        return root
+    }
 
     /** 某个版本的根目录（其下是 `node_modules/`）。 */
     fun engineRoot(context: Context, version: String): File =
@@ -586,8 +676,19 @@ object DSHRunner {
      */
     fun dshHome(context: Context): File {
         val ver = currentVersion(context) ?: return legacyDshHome(context)
-        return File(appHomeDir(context), ".dsh-$ver")
+        return File(instanceHome(context), ".dsh-$ver")
     }
+
+    /**
+     * 进程的 HOME：`filesDir/home`。
+     *
+     * 所有版本共用同一个 HOME；「互不相通」由 `$DSH_HOME`
+     * （`home/.dsh-<版本键>`）那一层区分，不靠切 HOME。
+     *
+     * **所有「HOME 下的某个路径」都必须经由这里推导** ——
+     * 各自拼 `filesDir` 会让工作区与 `$DSH_HOME` 落到不同目录。
+     */
+    fun instanceHome(context: Context): File = appHomeDir(context)
 
     /**
      * 起进程前确保当前版本的数据目录就绪；老用户第一次升级时迁移一次旧数据。
@@ -675,12 +776,12 @@ object DSHRunner {
      * 工作区根目录（`Documents` 那一层）。dsh 的默认工作区落在
      * `<Documents>/deepseek-harness`。
      *
-     * 这里**不按版本切**：dsh 自己的状态（会话 / 插件 / 凭据）已经由
-     * [dshHome] 隔离，而 Documents 是用户自己的文件与项目，
-     * 按版本藏起来会让老用户升级后看不到原有项目，代价大于收益。
+     * 挂在**实例的 HOME** 下：同一版本的两个实例连工作区都不该共用 ——
+     * 否则在 A 里新建的会话，在 B 里会看到同一批项目文件，
+     * 「完全不互通」就不成立了。没有实例时回落到老的 `filesDir/home/Documents`。
      */
     fun workspaceDir(context: Context): File =
-        File(appHomeDir(context), "Documents")
+        File(instanceHome(context), "Documents")
 
     /**
      * 删除一个引擎版本：引擎目录 + 它自己的数据目录。
@@ -700,7 +801,7 @@ object DSHRunner {
     fun deleteVersion(context: Context, version: String, onProgress: (Float) -> Unit): Boolean {
         val engine = engineRoot(context, version)
         // 只删这个版本自己的数据目录，绝不碰 legacyDshHome
-        val data = File(appHomeDir(context), ".dsh-$version")
+        val data = File(instanceHome(context), ".dsh-$version")
 
         var total = 0
         fun count(dir: File) {
@@ -738,6 +839,25 @@ object DSHRunner {
         // 只删本版本那一层，绝不碰共享根目录下的其它版本。
         runCatching { removeAttachmentsForVersion(context, version) }
         val gone = !engine.exists() && !data.exists()
+
+        // ── 同步实例元数据 ★ 关键 ★ ────────────────────────────────────
+        //
+        // 「这个实例装了哪个版本」记在 instance.json 里，而上面删的是**目录**。
+        // 不同步的话，版本管理面板仍会按旧元数据列出这个实例 ——
+        // 看起来有这一项，选中却启动不了（引擎已经不在了）。
+        //
+        // 这里把版本号清空，实例本身保留：用户可能只是想换一个版本，
+        // 直接删实例会把他的工作区与会话一起带走，那是另一种破坏。
+        runCatching {
+            val id = Instances.activeId(context)
+            if (id != null) {
+                val inst = Instances.byId(context, id)
+                if (inst != null && inst.version == version) {
+                    Instances.setVersion(context, id, "")
+                    onLog("ℹ️ 实例「${inst.name}」已清空版本记录（引擎已删除，可重新安装）")
+                }
+            }
+        }
 
         // 指针清理由 LauncherPrefs 负责，这里不硬编码 SharedPreferences 键名
         if (LauncherPrefs.getEngineVersion(context) == version) {
@@ -2207,9 +2327,12 @@ object DSHRunner {
             return false
         }
 
-        val dest = engineRoot(context, ver)
-        // 同版本重装＝覆盖，先清掉旧的，避免两代文件混在一起
-        runCatching { dest.deleteRecursively() }
+        // 同版本已经在磁盘上时**自动加后缀**（`0.2.1` → `0.2.1-2`），
+        // 不需要用户起名字或确认：部署的标识就是版本键。
+        //
+        // 不删旧目录：allocateVersion 保证返回空闲键，会删的只可能是别人的部署。
+        val key = Instances.allocateVersion(context, ver)
+        val dest = engineRoot(context, key)
         dest.parentFile?.mkdirs()
 
         val moved = incoming.renameTo(dest) || runCatching {
@@ -2220,22 +2343,22 @@ object DSHRunner {
         if (!moved) {
             runCatching { incoming.deleteRecursively() }
             runCatching { dataStaging.deleteRecursively() }
-            onLog("❌ 无法落盘到 lib/versions/$ver")
+            onLog("❌ 无法落盘到 lib/versions/$key")
             return false
         }
 
         // ── 部署数据目录（插件 / 插件数据 / MCP / 会话 / 登录状态）──────────
         //
-        // 目录名必须与 [dshHome] 的算法一致：`home/.dsh-<版本>`。
+        // 目录名必须与 [dshHome] 的算法一致：`home/.dsh-<版本键>`。
         // 这里不能调 dshHome() —— 它依赖 currentVersion，而指针要到下面才设置，
         // 此刻读到的还是上一个版本，会把数据装到别的版本目录里去。
         if (dataCount > 0) {
-            val dataTarget = File(appHomeDir(context), ".dsh-$ver")
+            val dataTarget = File(instanceHome(context), ".dsh-$key")
             if (dataTarget.isDirectory && dataTarget.list()?.isNotEmpty() == true) {
                 // 已有数据先改名备份，而不是直接删。
                 // 导入整合包通常是「恢复某人整理好的一整套环境」，
                 // 覆盖是预期行为，但万一导错了包，.bak 还能救回来。
-                val bak = File(dataTarget.parentFile, ".dsh-$ver.bak")
+                val bak = File(dataTarget.parentFile, ".dsh-$key.bak")
                 runCatching { bak.deleteRecursively() }
                 val backedUp = dataTarget.renameTo(bak)
                 if (!backedUp) {
@@ -2265,8 +2388,9 @@ object DSHRunner {
             runCatching { dataStaging.deleteRecursively() }
         }
 
-        setCurrentVersion(context, ver)
-        onLog("✅ dsh 引擎安装完成（$ver，已设为当前版本）")
+        // 指针指向新的版本键 —— 否则装完不会自动切过去
+        setCurrentVersion(context, key)
+        onLog("✅ dsh 引擎安装完成（$ver → 目录 $key，已设为当前版本）")
         return true
     }
 
@@ -2456,7 +2580,14 @@ object DSHRunner {
             // migrateHomeIfNeeded 现在的职责是**反向收回复原**：
             // 若上一版在外部目录里留下过真实数据，把它合并回内部目录。
             // 它在**本工作线程**里跑，不阻塞 UI；失败不阻断启动。
-            val home = migrateHomeIfNeeded(context).absolutePath
+            // 实例模式下 HOME 是 `instances/<id>/home` —— 每个实例独一份，
+            // 工作区（Documents）与 `$DSH_HOME` 都挂在它下面。
+            // 没有实例时回落老的 `filesDir/home`，并顺手把上一版误迁到外部存储的
+            // 数据收回来（migrateHomeIfNeeded 现在的职责就只有这一件事）。
+            val home = (
+                if (Instances.activeId(context) != null) instanceHome(context)
+                else migrateHomeIfNeeded(context)
+                ).absolutePath
             val tmp = File(context.cacheDir, "tmp").apply { mkdirs() }.absolutePath
 
             val nodePath = File(prefix, "bin/node").absolutePath
@@ -2674,6 +2805,32 @@ object DSHRunner {
             env["TMPDIR"] = tmp
             env["LD_LIBRARY_PATH"] = "$prefix/lib"
             env["PATH"] = "$prefix/bin:/system/bin"
+            // ── 把容器的 node_modules 显式挂进解析链 ★ 必须 ★ ─────────────
+            //
+            // ## 修的是什么
+            //
+            // 引擎目录从 `files/usr/lib/versions/<ver>` 搬到了
+            // `instances/<id>/usr/lib/versions/<ver>`。这一搬**打断了 Node 的
+            // 向上查找链**，直接导致启动崩溃：
+            //
+            // ```
+            // host preparation failed:
+            //   No usable native binding found for node-addon-require-builtin-android-arm64
+            // ```
+            //
+            // 原因：Node 解析 `require('x')` 时会从当前文件所在目录逐级往上
+            // 找 `node_modules`。旧位置往上走第 5 层正好是
+            // `files/usr/lib/node_modules`（容器自带的包，含 bionic 构建的原生模块）；
+            // 新位置往上走只会到 `files/node_modules`，**永远碰不到容器那一层**。
+            //
+            // 代码里另一处注释其实早就写明了这个依赖关系（见 checkEngineDeps：
+            // 「容器自带的包也算可解析，Node 会沿解析链往上找到 usr/lib/node_modules」），
+            // 是我搬目录时漏掉了这条隐含耦合。
+            //
+            // `NODE_PATH` 让 CommonJS 的 `require` 额外搜索这个目录 ——
+            // 本次崩溃的调用栈正是 CJS（Module._compile / Module.require），
+            // 所以这一行就能恢复原来的解析能力。
+            env["NODE_PATH"] = "$prefix/lib/node_modules"
             // 数据目录：隔离开启时按版本分开，关闭时用老位置。
             // 不要把这里写死成 "$home/.dsh" —— 那样和实例设置面板显示的对不上。
             env["DSH_HOME"] = dshHomeDir.absolutePath
@@ -2695,6 +2852,24 @@ object DSHRunner {
             if (permissionMode.dangerous) {
                 onLog("⚠️ 完全访问模式：命令将以 App 身份无隔离执行")
             }
+            // 沙箱后端探测。**必须在这里说清楚**：Android 一般既没有 bwrap
+            // 也没有 Landlock，于是默认的 workspace-write 会让所有 bash 失败。
+            // 不提前报的话，用户只会看到 agent 反复试 bash 然后报一句 dsh 内部的
+            // unsupported，完全看不出根因是本机没后端。
+            //
+            // 本方法运行在工作线程上，所以允许 verify=true（会起一个短命子进程）。
+            runCatching {
+                SandboxBackend.logReport(
+                    mode = permissionMode,
+                    prefix = File(prefix),
+                    onLog = onLog
+                )
+            }.onFailure { onLog("⚠️ 沙箱后端探测失败: ${it.message}") }
+
+            // 这一次是全新启动：清掉上次的「正在停止」标记与残留输出，
+            // 否则上一次主动停止留下的 stopping=true 会让这次崩溃被当成正常退出。
+            stopping = false
+            synchronized(recentOutput) { recentOutput.clear() }
 
             val started = pb.start()
             process = started
@@ -2709,7 +2884,11 @@ object DSHRunner {
             // 表现就是「点停止、点重启都崩溃」——这正是本 bug 的直接原因。
             Thread {
                 try {
-                    started.errorStream.bufferedReader().forEachLine { onLog("ERR: $it") }
+                    started.errorStream.bufferedReader().forEachLine {
+                        // 留一份给「启动失败」时展示：用户不需要自己翻几百行 ERR
+                        rememberOutput("ERR: $it")
+                        onLog("ERR: $it")
+                    }
                 } catch (e: java.io.IOException) {
                     // 进程结束时的正常收场，安静退出
                 } catch (e: Exception) {
@@ -2726,14 +2905,36 @@ object DSHRunner {
             try {
                 while (true) {
                     val line = reader.readLine() ?: break
+                    rememberOutput(line)
                     onLog(line)
                     regex.find(line)?.let { onUrlReady(it.value) }
                 }
+                // 循环正常结束 = 流到 EOF = 进程已退出。
+                // 这里以前只写一句日志就收工，runState 会永远停在 STARTING。
+                onLog("⏹ Node 输出流已关闭（进程已退出）")
             } catch (e: java.io.IOException) {
                 onLog("Node 输出流已关闭（进程已退出）")
+            } finally {
+                // ── 关键：进程退出必须通知界面 ────────────────────────────
+                //
+                // 只有「退出的正是当前进程」才回调。
+                // stopProcess() 已经先把 process 置空，所以**用户主动停止**
+                // 会走到这里但 isCurrent=false —— 那种情况的界面状态由
+                // stopInstance / restartInstance 自己负责，不该在这里再改一次。
+                //
+                // 反过来，进程自己崩掉时 process 仍指向它，isCurrent=true，
+                // 界面就能从 STARTING 切到 ERROR 并拿到最后几行输出。
+                if (process === started) {
+                    process = null
+                    currentPort = 0
+                    val code = runCatching { started.exitValue() }.getOrNull()
+                    onExited?.invoke(stopping, code)
+                }
             }
         } catch (e: Exception) {
             onLog("❌ 启动失败: ${e.message}")
+            // 拉起阶段就抛异常（进程根本没起来）：同样要让界面脱离 STARTING
+            onExited?.invoke(false, null)
         }
     }
 }

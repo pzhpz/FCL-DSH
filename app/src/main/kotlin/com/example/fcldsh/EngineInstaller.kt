@@ -82,18 +82,21 @@ object EngineInstaller {
         Thread {
             var conn: HttpURLConnection? = null
             try {
-                conn = (URL(REGISTRY_URL).openConnection() as HttpURLConnection).apply {
+                // 用非空局部变量接住：conn 是可为空的 var（finally 里要关它），
+                // 直接链式调用会被判成「可空接收者」。
+                val c = (URL(REGISTRY_URL).openConnection() as HttpURLConnection).apply {
                     connectTimeout = 15_000
                     readTimeout = 20_000
                     instanceFollowRedirects = true
                     setRequestProperty("User-Agent", "fcl-dsh/1.0 (Android)")
                     setRequestProperty("Accept", "application/json")
                 }
-                val code = conn.responseCode
+                conn = c
+                val code = c.responseCode
                 if (code !in 200..299) {
                     throw IllegalStateException("HTTP $code")
                 }
-                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val body = c.inputStream.bufferedReader().use { it.readText() }
                 val json = JSONObject(body)
 
                 // dist-tags：{"latest":"0.2.1-rc.2","next":"0.2.1-rc.4",...}
@@ -316,9 +319,13 @@ object EngineInstaller {
                 val realVer = readVersionFrom(from) ?: version
 
                 // 先装到 __incoming__，整棵树就位后再一次性改名成正式版本号。
-                // 直接写 lib/versions/<ver> 的话，中途失败会留下一个
+                // 直接写 <版本根>/<ver> 的话，中途失败会留下一个
                 // 「看起来存在、其实残缺」的版本目录，之后每次启动都失败却查不出原因。
-                val incoming = File(usr, "lib/versions/__incoming__")
+                //
+                // 版本根必须走 DSHRunner.versionsDir()：实例模式下是
+                // `instances/<id>/usr/lib/versions`，自己拼 filesDir/usr 会装错地方。
+                val versionsRoot = DSHRunner.versionsDir(context)
+                val incoming = File(versionsRoot, "__incoming__")
                 runCatching { incoming.deleteRecursively() }
                 val incomingScope = File(incoming, "node_modules")
                 incomingScope.mkdirs()
@@ -366,9 +373,13 @@ object EngineInstaller {
                 // 容器自带的 bionic 版本（@vscode/ripgrep-android-arm64 等）才是能跑的；
                 // 缺少的原生能力（flock）由 DSHRunner.ensureFlockShim 用纯 JS 替代。
 
-                val target = File(usr, "lib/versions/$realVer")
-                // 同版本重装＝覆盖，先清掉旧的，避免两代文件混在一起
-                runCatching { target.deleteRecursively() }
+                // 同版本已经在磁盘上时**自动加后缀**（`0.2.1` → `0.2.1-2`），
+                // 不再弹窗让用户起名字：部署的标识就是版本键，冲突由它自己解决。
+                //
+                // 这里刻意不再 `deleteRecursively()` 旧目录 —— allocateVersion
+                // 保证返回的是空闲键，会删的只可能是别的部署。
+                val key = Instances.allocateVersion(context, realVer)
+                val target = File(versionsRoot, key)
                 target.parentFile?.mkdirs()
                 val moved = incoming.renameTo(target) || runCatching {
                     incoming.copyRecursively(target, overwrite = true)
@@ -379,13 +390,13 @@ object EngineInstaller {
                     runCatching { incoming.deleteRecursively() }
                     post {
                         installPhase = InstallPhase.ERROR
-                        installMessage = "无法落盘到 lib/versions/$realVer"
+                        installMessage = "无法落盘到 lib/versions/$key"
                     }
                     return@Thread
                 }
 
                 // 新装好的版本直接设为当前 —— 用户点「下载」就是为了用它
-                DSHRunner.setCurrentVersion(context, realVer)
+                DSHRunner.setCurrentVersion(context, key)
                 // 新版本里也有一份 node-addon-system，flock 需要一并替换
                 DSHRunner.ensureFlockShim(context)
 
@@ -576,7 +587,14 @@ object EngineInstaller {
                 "add", "@deepseek-ai/dsh@$version",
                 "--dir", staging.absolutePath,
                 "--ignore-scripts",
-                "--config.optional=false",
+                // 与 npm 分支同理：要的是「只装 android 平台的可选依赖」，
+                // 不是「一个可选依赖都不装」。
+                //
+                // `--config.optional=false` 会把 node-addon-require-builtin-android-arm64
+                // 这类**上游专门为 Android 发布**的原生绑定一起排除，
+                // dsh 0.2.2+ 启动时就会因为找不到原生绑定直接崩溃。
+                "--config.supportedArchitectures.os=android",
+                "--config.supportedArchitectures.cpu=${npmCpuForDevice()}",
                 "--reporter=append-only"
             )
         } else {
@@ -585,18 +603,36 @@ object EngineInstaller {
                 "--prefix", staging.absolutePath,
                 // 不跑 postinstall：否则 node-pty / sharp 会去下 Linux x64 原生包
                 "--ignore-scripts",
-                // 跳过平台相关可选依赖。
+                // ── 平台选择：装 **android** 变体，而不是丢掉所有可选依赖 ──
                 //
-                // 这里曾改成 `--os=linux --cpu=<arch>` 想把 linux 平台包补齐，
-                // 但那条路已被证伪：那些包是 glibc/musl 构建，Android 的 bionic
-                // 缺少 __errno_location 符号，dlopen 必然失败：
-                //   dlopen failed: cannot locate symbol "__errno_location"
-                // 所以装进来只会制造新的报错，不能解决问题。
+                // ## ★ 这里修的是一个真实的启动失败 ★
                 //
-                // 真正缺失的原生功能（如 flock）改为用纯 JS 替代实现，
-                // 见 DSHRunner.ensureFlockShim()。容器自带的 bionic 版本
-                // （如 @vscode/ripgrep-android-arm64）才是能在 Android 上跑的。
-                "--omit=optional",
+                // 原先写的是 `--omit=optional`，理由是「平台相关可选依赖都是
+                // linux 构建，装进来也跑不了」。这个理由只对了一半：
+                //
+                // | 包 | 能否在 Android 上跑 | 该不该装 |
+                // |---|---|---|
+                // | `@img/sharp-linux-x64`、`@vscode/ripgrep-linux-arm64` | ❌ glibc 构建，bionic 缺 `__errno_location` | 不装 |
+                // | `node-addon-require-builtin-**android-arm64**` | ✅ 上游专门为 Android 发布 | **必须装** |
+                //
+                // `--omit=optional` 把两类一起砍了，于是 dsh 0.2.2+ 启动即崩：
+                //
+                // ```
+                // host preparation failed:
+                //   No usable native binding found for node-addon-require-builtin-android-arm64
+                // ```
+                //
+                // 换成显式的 `--os/--cpu` 后，npm 会按 package.json 的
+                // `os`/`cpu` 字段筛选：android 变体装上，linux 变体自动排除。
+                // 既拿到了需要的原生绑定，又不会引入跑不了的 linux 二进制。
+                //
+                // ⚠️ 必须显式传 `--os=android`，不能依赖 npm 自动探测：
+                // 容器里有个 spawn 补丁把 `process.platform` 伪装成 `linux`
+                //（为了让只认 linux 的库肯加载），npm 因此会把平台判成 linux，
+                // 装出 `linux-arm64` / `linux-x64` 而漏掉 android 变体 ——
+                // 日志里「平台专属包: linux-arm64, linux-x64」就是那次误判的产物。
+                "--os=android",
+                "--cpu=${npmCpuForDevice()}",
                 "--no-audit",
                 "--no-fund",
                 // notice 而不是 warn：warn 会把「added N packages」这类收尾统计
@@ -641,10 +677,18 @@ object EngineInstaller {
 
         val env = pb.environment()
         env["PREFIX"] = usr.absolutePath
-        env["HOME"] = com.appHomeDir(context).absolutePath
+        // npm 的 HOME 必须与「进度采样盯的那个目录」一致（见下面的 homeDir）：
+        // 两处都走 DSHRunner.instanceHome()。若这里用 filesDir/home，而下面盯的是
+        // 实例 HOME，`.npm/_cacache` 永远不增长 → 被静默判死，安装中途被误杀。
+        env["HOME"] = DSHRunner.instanceHome(context).absolutePath
         env["TMPDIR"] = File(context.cacheDir, "tmp").apply { mkdirs() }.absolutePath
         env["LD_LIBRARY_PATH"] = File(usr, "lib").absolutePath
         env["PATH"] = "${File(usr, "bin").absolutePath}:/system/bin"
+        // 与运行期保持一致：引擎现在装在 `instances/<id>/usr/...`，
+        // 向上查找 `node_modules` 到不了容器的 `files/usr/lib/node_modules`。
+        // 安装阶段（npm 解析依赖、跑 lifecycle）同样需要看到容器自带的包，
+        // 否则装出来的依赖树会和运行期实际能解析到的对不上。
+        env["NODE_PATH"] = File(usr, "lib/node_modules").absolutePath
         // 关掉 npm 自身的更新检查，省掉一次网络往返
         env["npm_config_update_notifier"] = "false"
         env["npm_config_fund"] = "false"
@@ -681,7 +725,10 @@ object EngineInstaller {
         // npm 在 `--no-progress --loglevel=notice` 下下载阶段完全静默，
         // 只要缓存目录还在变大就视为正常。
         val silenceLimitMs = 10 * 60_000L
-        val homeDir = com.appHomeDir(context)
+        // ★ 必须与 env["HOME"] 指向同一处 ★
+        // 这里盯的是 npm 的缓存目录，若与子进程实际写入的位置不一致，
+        // 「文件系统无增长」会永远成立 → 安装被静默上限误杀。
+        val homeDir = DSHRunner.instanceHome(context)
         val cacheDir = File(homeDir, ".npm")
 
         // 总字节数的自适应估计：基线取 60MB（dsh 依赖树的经验量级）。
@@ -990,7 +1037,10 @@ object EngineInstaller {
             pb.redirectErrorStream(true)
             pb.environment().apply {
                 put("LD_LIBRARY_PATH", File(usr, "lib").absolutePath)
-                put("HOME", com.appHomeDir(context).absolutePath)
+                // 与正式安装保持一致的 HOME：两处都走实例 HOME，
+                // 否则预检看到的 npm 缓存/配置与真正安装时不是同一份，
+                // 结论会失真（例如预检「能装」而实际因缓存路径不同而失败）。
+                put("HOME", DSHRunner.instanceHome(context).absolutePath)
                 put("TMPDIR", File(context.cacheDir, "tmp").apply { mkdirs() }.absolutePath)
                 put("PATH", "${File(usr, "bin").absolutePath}:/system/bin")
             }
@@ -1040,7 +1090,10 @@ object EngineInstaller {
             pb.redirectInput(ProcessBuilder.Redirect.from(File("/dev/null")))
             pb.environment().apply {
                 put("PREFIX", usr.absolutePath)
-                put("HOME", com.appHomeDir(context).absolutePath)
+                // 与正式安装保持一致的 HOME：两处都走实例 HOME，
+                // 否则预检看到的 npm 缓存/配置与真正安装时不是同一份，
+                // 结论会失真（例如预检「能装」而实际因缓存路径不同而失败）。
+                put("HOME", DSHRunner.instanceHome(context).absolutePath)
                 put("TMPDIR", File(context.cacheDir, "tmp").apply { mkdirs() }.absolutePath)
                 put("LD_LIBRARY_PATH", File(usr, "lib").absolutePath)
                 put("PATH", "${File(usr, "bin").absolutePath}:/system/bin")

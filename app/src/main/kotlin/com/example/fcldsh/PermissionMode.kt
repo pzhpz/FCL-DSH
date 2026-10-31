@@ -134,6 +134,7 @@ object LauncherPrefs {
     private const val KEY_ENGINE_VERSION = "engine_version"
     private const val KEY_VERSION_ISOLATION = "version_isolation"
     private const val KEY_DATA_MIGRATED = "data_migrated"
+    private const val KEY_PLUGIN_SOURCE = "plugin_source_url"
 
     /**
      * dsh 引擎下载地址的默认值。
@@ -169,6 +170,26 @@ object LauncherPrefs {
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_ENGINE_URL, url.trim())
+            .apply()
+    }
+
+    /**
+     * 插件下载源（自定义索引地址）。空串表示用内置的 [DSHOPEN_INDEX]。
+     *
+     * 单独存一项而不是复用引擎地址：两者是完全不同的东西
+     * （一个指向引擎 zip，一个指向插件市场的 index.json），
+     * 混用会让用户改了一个另一个跟着变。
+     */
+    fun getPluginSourceUrl(context: Context): String {
+        val sp = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        return sp.getString(KEY_PLUGIN_SOURCE, "").orEmpty()
+    }
+
+    /** 写入插件下载源；传空串即恢复默认源。 */
+    fun setPluginSourceUrl(context: Context, url: String) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_PLUGIN_SOURCE, url.trim())
             .apply()
     }
 

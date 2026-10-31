@@ -1,12 +1,17 @@
 package com.example.fcldsh
 
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -54,11 +59,12 @@ enum class InstanceTab(val label: String) {
     DSH("dsh设置"),
     PLUGIN("插件管理"),
     SESSION("会话管理"),
+    SKILL("skill管理"),
     MCP("mcp管理");
 
     companion object {
         /** 按显示顺序。不用 `entries`，兼容老一些的 Kotlin 编译器。 */
-        val all: List<InstanceTab> = listOf(DSH, PLUGIN, SESSION, MCP)
+        val all: List<InstanceTab> = listOf(DSH, PLUGIN, SESSION, SKILL, MCP)
     }
 }
 
@@ -85,7 +91,31 @@ fun InstanceSettingsPanel(
     onSelectTab: (InstanceTab) -> Unit,
     onExportEngine: () -> Unit,
     /** 删除当前版本。真正的删除（后台线程 + 进度 + 停实例）由 MainActivity 负责。 */
-    onDeleteVersion: () -> Unit
+    onDeleteVersion: () -> Unit,
+    /** 把当前实例的第三方插件（含依赖闭包）打成一个包。 */
+    onExportPlugins: () -> Unit,
+    /** 选一个插件包导入，**直接写入 dsh**（解包 + 登记 profile 清单）。 */
+    onImportPlugins: () -> Unit,
+    /** 把当前实例的全部会话（含标题缓存）打成一个包。 */
+    onExportSessions: () -> Unit,
+    /** 选一个会话包导入，**直接写入 dsh**（已存在的会话跳过）。 */
+    onImportSessions: () -> Unit,
+    /** 只导出指定的一个插件（包名，含 scope）。 */
+    onExportPlugin: (String) -> Unit,
+    /** 只导出指定的一个会话（[SessionInfo.id]）。 */
+    onExportSession: (String) -> Unit,
+    /** 把当前实例的全部 skill 打成一个包。 */
+    onExportSkills: () -> Unit,
+    /** 选一个 skill 包导入，**直接写入 dsh**（已存在的文件跳过）。 */
+    onImportSkills: () -> Unit,
+    /** 只导出指定的一个 skill（目录名，所在根目录标签）。 */
+    onExportSkill: (String, String) -> Unit,
+    /** 把当前实例的全部 MCP 相关文件打成一个包。 */
+    onExportMcp: () -> Unit,
+    /** 选一个 MCP 包导入，**直接写入 dsh**（已存在的文件跳过）。 */
+    onImportMcp: () -> Unit,
+    /** 只导出指定的一个 MCP 配置（相对 `DSH_HOME` 的路径）。 */
+    onExportMcpConfig: (String) -> Unit
 ) {
     val context = LocalContext.current
 
@@ -96,6 +126,12 @@ fun InstanceSettingsPanel(
     // dshHome 现在按版本独立（home/.dsh-<版本>），不再有隔离开关 ——
     // 「各个 dsh 不互通」是默认行为，不需要用户选择。
     val dshHome = remember(tick, state.engineVersion) { DSHRunner.dshHome(context) }
+
+    // 内置 bundle（`@deepseek-ai/` 作用域）解析不到的兜底位置：引擎自己的 node_modules。
+    // 插件页要靠它才能区分「内置」与「用户装的第三方插件」。
+    val engineModules = remember(tick, state.engineVersion) {
+        state.engineVersion?.let { File(DSHRunner.engineRoot(context, it), "node_modules") }
+    }
 
     // 返回键收回面板 —— 与下载中心 / 启动器设置保持一致。
     // 面板内不放「关闭」按钮，收回统一交给侧栏的房子图标或返回键。
@@ -131,50 +167,144 @@ fun InstanceSettingsPanel(
                 InstanceTabBar(selected = tab, onSelect = onSelectTab)
             }
 
-            Column(
+            // ★ 这里不能再无脑套 verticalScroll ★
+            //
+            // 插件页与会话页改成了「左面板 + 右列表」两栏，两栏各自滚动，
+            // 需要**有界高度**。而 verticalScroll 会把子项的高度约束成无限，
+            // 里面的 weight / fillMaxHeight 全部失效，两栏会塌成内容高度、
+            // 左右分栏根本立不起来。
+            //
+            // 所以滚动下沉到各页自己管：DSH / MCP 仍由 [ScrollingTab] 提供，
+            // 插件 / 会话页自己分栏滚动。
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 4.dp)
             ) {
                 when (tab) {
-                    InstanceTab.DSH -> DshSettingsTab(
-                        state = state,
-                        dshHome = dshHome,
-                        onExportEngine = onExportEngine,
-                        // ★ 这里必须调用传进来的 onDeleteVersion ★
-                        //
-                        // 上一版写成了同名 lambda，只是 tick++ 刷新一下自己，
-                        // 把真正的回调（MainActivity.requestDeleteVersion）完全遮蔽掉 ——
-                        // 表现就是「弹了确认框，点删除什么都没发生，也没有进度窗」。
-                        // 刷新交给删除完成后 MainActivity 里的 refreshEngineVersion，
-                        // 不在这里做。
-                        onDeleteVersion = onDeleteVersion
-                    )
+                    InstanceTab.DSH -> ScrollingTab {
+                        DshSettingsTab(
+                            state = state,
+                            dshHome = dshHome,
+                            onExportEngine = onExportEngine,
+                            // ★ 这里必须调用传进来的 onDeleteVersion ★
+                            //
+                            // 上一版写成了同名 lambda，只是 tick++ 刷新一下自己，
+                            // 把真正的回调（MainActivity.requestDeleteVersion）完全遮蔽掉 ——
+                            // 表现就是「弹了确认框，点删除什么都没发生，也没有进度窗」。
+                            // 刷新交给删除完成后 MainActivity 里的 refreshEngineVersion，
+                            // 不在这里做。
+                            onDeleteVersion = onDeleteVersion
+                        )
+                    }
 
                     InstanceTab.PLUGIN -> PluginTab(
                         dshHome = dshHome,
+                        engineModules = engineModules,
                         tick = tick,
-                        onRefresh = { tick++ }
+                        onRefresh = { tick++ },
+                        onExport = onExportPlugins,
+                        onImport = onImportPlugins,
+                        onExportPlugin = onExportPlugin
                     )
 
                     InstanceTab.SESSION -> SessionTab(
                         dshHome = dshHome,
                         tick = tick,
-                        onRefresh = { tick++ }
+                        onRefresh = { tick++ },
+                        onExport = onExportSessions,
+                        onImport = onImportSessions,
+                        onExportSession = onExportSession
                     )
 
+                    InstanceTab.SKILL -> SkillTab(
+                        dshHome = dshHome,
+                        tick = tick,
+                        onRefresh = { tick++ },
+                        onExport = onExportSkills,
+                        onImport = onImportSkills,
+                        onExportSkill = onExportSkill
+                    )
+
+                    // MCP 也改用两栏：它现在要多显示「扫描位置」，
+                    // 单栏滚到底才能看到，不如和插件/会话/skill 页保持一致。
                     InstanceTab.MCP -> McpTab(
                         dshHome = dshHome,
                         tick = tick,
-                        onRefresh = { tick++ }
+                        onRefresh = { tick++ },
+                        onExport = onExportMcp,
+                        onImport = onImportMcp,
+                        onExportMcpConfig = onExportMcpConfig
                     )
                 }
-
-                Spacer(modifier = Modifier.height(20.dp))
             }
         }
+    }
+}
+
+/**
+ * 纵向滚动的单栏页签内容（dsh 设置 / mcp 管理用）。
+ *
+ * 这两页是纯列表，套一层滚动最简单；插件 / 会话页要分栏，
+ * 需要自己去分配高度，不能用这个容器包着。
+ */
+@Composable
+private fun ScrollingTab(content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .fillMaxHeight()
+            .verticalScroll(rememberScrollState())
+    ) {
+        content()
+        Spacer(modifier = Modifier.height(20.dp))
+    }
+}
+
+/**
+ * 「左侧面板 + 右侧列表」两栏布局。
+ *
+ * ## 宽度分配
+ *
+ * 左栏（操作面板）占 **三分之一**，右栏（列表）占 **三分之二** ——
+ * 按要求用 `weight(1f)` 与 `weight(2f)`。列表是主要阅读对象，给更宽；
+ * 左侧只放按钮与只读信息，窄一点够用。
+ *
+ * ## 两栏各自滚动
+ *
+ * 左栏有操作按钮 + 内置插件 + 扫描位置，可能比右栏还长；共用一个滚动条的话
+ * 会互相拖累（滚左栏把列表滚出视野）。所以各自 `verticalScroll`，
+ * 互不影响。
+ *
+ * ## 高度必须由调用方给成有界
+ *
+ * 这里用 `fillMaxHeight`，依赖父级已有确定高度。若外层再套
+ * `verticalScroll`，高度约束变成无限，两栏会塌成内容高度 ——
+ * 详见 [InstanceSettingsPanel] 里那段注释。
+ */
+@Composable
+private fun SplitPane(
+    left: @Composable ColumnScope.() -> Unit,
+    right: @Composable ColumnScope.() -> Unit
+) {
+    Row(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
+        ) { left() }
+
+        // 两栏之间留一点缝，否则两张卡片贴在一起像一整个
+        Spacer(modifier = Modifier.width(10.dp))
+
+        Column(
+            modifier = Modifier
+                .weight(2f)
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
+        ) { right() }
     }
 }
 
@@ -311,7 +441,7 @@ private fun DshSettingsTab(
         onDeleteVersion = onDeleteVersion
     )
 
-    Spacer(modifier = Modifier.height(8.dp))
+    Spacer(modifier = Modifier.height(6.dp))
 
     // ── 目录 ────────────────────────────────────────────────────────
     FclSettingSection("目录")
@@ -336,7 +466,7 @@ private fun DshSettingsTab(
         shape = RowShape.BOTTOM
     )
 
-    Spacer(modifier = Modifier.height(8.dp))
+    Spacer(modifier = Modifier.height(6.dp))
 
     FclSettingRow(
         label = "工作区",
@@ -457,7 +587,7 @@ private fun FclConfirmDialog(
                     lineHeight = 17.sp
                 )
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -529,12 +659,20 @@ private fun WorkspacePathRow(label: String, path: String, shape: RowShape) {
  * @param version 从 `package.json` 读到的版本；读不到为空串
  * @param dir     包目录
  * @param where   相对 `DSH_HOME` 的位置，用于在列表里说清「装在哪」
+ * @param builtin 是否是引擎自带、用户没装过的内置 bundle（`@deepseek-ai/` 作用域下的包）。
+ *   这类不算「插件」，单独归到「内置」一栏 —— 混在主列表里会让用户看到一堆
+ *   自己不认识的名字，以为装错了东西。
+ * @param title   插件自己声明的**显示名**（中文优先）。包名是 `dsh-whale-widget`
+ *   这种机器名，用户认不出；插件在市场/管理器里显示的名字由包内清单提供，
+ *   见 [readPluginTitle]。取不到时为空串，界面退回显示包名。
  */
 private data class PluginInfo(
     val name: String,
     val version: String,
     val dir: File,
-    val where: String
+    val where: String,
+    val builtin: Boolean = false,
+    val title: String = ""
 )
 
 /**
@@ -576,141 +714,515 @@ private data class PluginScan(
  * 面板里改文件会绕开它的一致性检查。
  */
 @Composable
-private fun PluginTab(dshHome: File, tick: Int, onRefresh: () -> Unit) {
-    val scan = remember(tick) { scanPlugins(dshHome) }
+private fun PluginTab(
+    dshHome: File,
+    engineModules: File?,
+    tick: Int,
+    onRefresh: () -> Unit,
+    onExport: () -> Unit,
+    onImport: () -> Unit,
+    onExportPlugin: (String) -> Unit
+) {
+    val context = LocalContext.current
 
-    FclSettingSection("插件")
+    // 市场索引缓存下来的「包名 → 显示名」。
+    //
+    // ★ 为什么需要它 ★
+    //
+    // 插件包的 package.json 里**没有**显示名字段 —— 实测 dsh-whale-widget
+    // 只有 name / description / keywords，所以这里以前只能显示
+    // `dsh-whale-widget` 这种用户认不出的机器名。
+    // 而「插件下载」页能显示「余额小鲸鱼挂件」，是因为它读的是市场索引里的
+    // `title: { zh, en }`。[PluginDownloader] 拉列表时把那映射缓存到了磁盘，
+    // 这里直接复用，不需要再发一次网络请求（离线也能用）。
+    val marketTitles = remember(tick) { PluginDownloader.cachedTitles(context) }
 
-    if (scan.items.isEmpty()) {
-        EmptyState(
-            title = "还没有插件",
-            detail = "在下面列出的位置都没找到已安装的插件。装完点「刷新列表」再试。"
-        )
-    } else {
-        scan.items.forEachIndexed { i, p ->
-            FclSettingRow(
-                label = if (p.version.isBlank()) p.name else "${p.name}  ${p.version}",
-                // 说明装在哪，便于用户自己核对
-                description = p.where,
-                shape = RowShape.of(i, scan.items.size)
-            ) {
-                Text(text = "已装", color = Fcl.Success, fontSize = 10.sp)
-            }
-        }
+    val scan = remember(tick, engineModules, marketTitles) {
+        scanPlugins(dshHome, engineModules, marketTitles)
     }
 
-    Spacer(modifier = Modifier.height(8.dp))
+    // 订阅忙碌状态：导出进行中时行内的「导出」按钮要真的点不动
+    val busy = PluginSessionTransfer.busy
 
-    // 把扫描路径摊开：这是排查「装了却看不到」的关键信息。
-    FclSettingSection("扫描位置")
-    if (scan.searched.isEmpty()) {
-        EmptyState(title = "没有可扫描的目录", detail = "数据目录尚未创建。")
-    } else {
-        scan.searched.forEachIndexed { i, path ->
-            val exists = remember(path) { File(path).isDirectory }
-            FclSettingRow(
-                label = if (exists) "已存在" else "不存在",
-                description = path,
-                shape = RowShape.of(i, scan.searched.size)
-            ) {
-                Text(
-                    text = if (exists) "✓" else "—",
-                    color = if (exists) Fcl.Success else Fcl.TextTertiary,
-                    fontSize = 11.sp
+    // 待确认删除的插件。非空即弹确认窗 —— 删除不可逆，
+    // 不能让行内按钮一点就执行（它就在「导出」旁边，很容易误触）。
+    var pendingDelete by remember { mutableStateOf<PluginInfo?>(null) }
+
+    // 删盘是阻塞 IO，必须离开主线程；做完再回主线程刷新列表。
+    // 用 Handler + Thread 而不是协程：本项目其它后台任务都是这个写法，
+    // 保持一致，也不额外引入依赖。
+    val main = remember { Handler(Looper.getMainLooper()) }
+
+    // 只把「用户自己装的」当插件。内置 bundle 单列一栏，否则主列表里会混进一堆
+    // 用户没装过、也认不出的名字（之前正是这个问题：2 个插件却列出 6 项）。
+    val userPlugins = scan.items.filter { !it.builtin }
+    val builtin = scan.items.filter { it.builtin }
+
+    SplitPane(
+        left = {
+            // ── 能操作的：全部集中在左栏顶部 ──
+            TransferActions(
+                kind = PluginSessionTransfer.Kind.PLUGINS,
+                refreshDesc = "重新扫描磁盘，装完插件后点这里。",
+                exportDesc = "全部第三方插件打成 zip（含依赖闭包）。",
+                importDesc = "解包并登记到 profile 清单，重启实例后生效。",
+                onRefresh = onRefresh,
+                onExport = onExport,
+                onImport = onImport
+            )
+
+            // ── 以下只读、不能操作，按要求放在左栏下方 ──
+            if (builtin.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                FclSettingSection("内置（引擎自带）")
+                builtin.forEachIndexed { i, p ->
+                    FclSettingRow(
+                        label = p.name.removePrefix("@deepseek-ai/"),
+                        description = p.version.ifBlank { "内置" },
+                        shape = RowShape.of(i, builtin.size)
+                    ) {
+                        Text(text = "内置", color = Fcl.TextTertiary, fontSize = 10.sp)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // 把扫描路径摊开：这是排查「装了却看不到」的关键信息。
+            FclSettingSection("扫描位置")
+            if (scan.searched.isEmpty()) {
+                EmptyState(title = "没有可扫描的目录", detail = "数据目录尚未创建。")
+            } else {
+                scan.searched.forEachIndexed { i, path ->
+                    val exists = remember(path) { File(path).isDirectory }
+                    FclSettingRow(
+                        label = if (exists) "已存在" else "不存在",
+                        description = path,
+                        shape = RowShape.of(i, scan.searched.size)
+                    ) {
+                        Text(
+                            text = if (exists) "✓" else "—",
+                            color = if (exists) Fcl.Success else Fcl.TextTertiary,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+        },
+        right = {
+            FclSettingSection("已安装插件（${userPlugins.size}）")
+
+            if (userPlugins.isEmpty()) {
+                EmptyState(
+                    title = "还没有装第三方插件",
+                    detail = "profile 的加载列表里没有内置以外的插件。装完点左侧「刷新列表」再试。"
                 )
+            } else {
+                userPlugins.forEachIndexed { i, p ->
+                    // 主标题是插件自己声明的显示名（"余额小鲸鱼挂件"），不是包名
+                    // （"dsh-whale-widget"）—— 后者只在没声明显示名时顶上。
+                    val title = p.title.ifBlank { p.name }
+                    FclSettingRow(
+                        label = if (p.version.isBlank()) title else "$title  ${p.version}",
+                        // 没有显示名时可说清了「装在哪」；有显示名时把包名放进描述，
+                        // 既认得又对得上 dsh 自己的名字。
+                        description = if (p.title.isBlank()) {
+                            p.where
+                        } else {
+                            "${p.name} · ${p.where}"
+                        },
+                        shape = RowShape.of(i, userPlugins.size)
+                    ) {
+                        Text(text = "已装", color = Fcl.Success, fontSize = 10.sp)
+                        Spacer(modifier = Modifier.width(10.dp))
+                        // 单项导出：只打这一个插件（+ 它的依赖闭包），
+                        // 适合把某一个插件单独发给别人，不用整包搬全部插件。
+                        RowAction(
+                            text = "导出",
+                            enabled = !busy,
+                            onClick = { onExportPlugin(p.name) }
+                        )
+                        Spacer(modifier = Modifier.width(2.dp))
+                        // 删除：目录 + profile 清单登记一起去掉（见 deletePlugin）。
+                        // 先弹确认窗，不直接执行。
+                        RowAction(
+                            text = "删除",
+                            enabled = !busy,
+                            danger = true,
+                            onClick = { pendingDelete = p }
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+        }
+    )
+
+    // 删除确认窗。放在 SplitPane 之后：它是覆盖层，不参与分栏布局。
+    pendingDelete?.let { target ->
+        ConfirmDialog(
+            title = "删除插件「${target.title.ifBlank { target.name }}」",
+            detail = "将删除 ${target.name} 的安装目录，并从 profile 加载清单里摘除。" +
+                "重启实例后彻底消失。此操作不可撤销，需要时可重新下载。",
+            onDismiss = { pendingDelete = null },
+            onConfirm = {
+                val pkg = target.name
+                pendingDelete = null
+                Thread {
+                    PluginSessionTransfer.deletePlugin(context, pkg)
+                    // 回主线程刷新：tick 变了列表才会重新扫盘
+                    main.post { onRefresh() }
+                }.start()
+            }
+        )
+    }
+}
+
+/**
+ * 行内小动作（FCL 里设置项右侧那种纯文字按钮）。
+ *
+ * 不用 Material 的 `Button`：它的内边距与最小高度会把 48dp 的行走形撑高，
+ * 与旁边那串「已装 / 内置」小字对不齐。这里只是一段可点的文字，
+ * 按下时有全局的缩放反馈（[Modifier.fclClickable]）。
+ *
+ * 禁用时**不挂手势**，而不是只把颜色调灰 —— 导入导出在后台跑，
+ * 「点了没反应」和「点不动」对用户的区别很大。
+ */
+@Composable
+private fun RowAction(
+    text: String,
+    enabled: Boolean = true,
+    /** 危险操作（删除）用警示色，与「导出」这类安全操作用视觉区分开。 */
+    danger: Boolean = false,
+    onClick: () -> Unit
+) {
+    val base = Modifier
+        .clip(RoundedCornerShape(Fcl.Radius))
+        .padding(horizontal = 6.dp, vertical = 4.dp)
+    Text(
+        text = text,
+        color = when {
+            !enabled -> Fcl.TextTertiary
+            danger -> Fcl.Danger
+            else -> Fcl.ThemeText
+        },
+        fontSize = 12.sp,
+        modifier = if (enabled) base.fclClickable { onClick() } else base
+    )
+}
+
+/**
+ * 破坏性操作的二次确认。
+ *
+ * 删除插件/会话是不可逆的（会话删了找不回来，插件删了要重装），
+ * 单点一下直接执行太容易误触 —— 行内「删除」按钮就在「导出」旁边，
+ * 手指一偏就点中了。
+ *
+ * 只提供「取消 / 确认」两个动作，不提供「不再提示」：
+ * 这类操作频率低，每次都确认更稳妥。
+ */
+@Composable
+private fun ConfirmDialog(
+    title: String,
+    detail: String,
+    confirmText: String = "删除",
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(dismissOnClickOutside = true)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(Fcl.Radius),
+            color = Fcl.Card
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = title,
+                    color = Fcl.TextPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = detail,
+                    color = Fcl.TextSecondary,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Row(horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onDismiss) {
+                        Text(text = "取消", color = Fcl.TextSecondary, fontSize = 12.sp)
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    TextButton(onClick = onConfirm) {
+                        Text(text = confirmText, color = Fcl.Danger, fontSize = 12.sp)
+                    }
+                }
             }
         }
     }
+}
 
-    Spacer(modifier = Modifier.height(8.dp))
+/**
+ * 左侧面板的操作区：刷新 / 导出全部 / 导入 + 结果行。插件页与会话页共用。
+ *
+ * ## 为什么忙碌时把 onClick 置成 null 而不是只改文字
+ *
+ * [FclSettingRow] 只有在 `onClick != null` 时才挂点击手势。置空等于**真的点不动**，
+ * 而不是「点了没反应」—— 导入导出在后台线程跑，连点两次会同时写同一个目录。
+ *
+ * 结果行只在有结果时出现，避免常驻一条空文案。
+ */
+@Composable
+private fun TransferActions(
+    kind: PluginSessionTransfer.Kind,
+    refreshDesc: String,
+    exportDesc: String,
+    importDesc: String,
+    onRefresh: () -> Unit,
+    onExport: () -> Unit,
+    onImport: () -> Unit
+) {
+    // 订阅这两个状态：busy 变化要立刻禁用按钮，lastResult 变化要显示结果
+    val busy = PluginSessionTransfer.busy
+    // ★ 必须按 kind 过滤 ★
+    //
+    // 两个页面共用同一份 lastResult。不过滤的话，导出插件后切到会话页会看到
+    // 「已导出 2 个插件」—— 用户会以为两页的数据串了。
+    val result = PluginSessionTransfer.lastResult
+        .takeIf { PluginSessionTransfer.lastResultKind == kind }
+        .orEmpty()
+
     FclSettingSection("操作")
+
     FclSettingRow(
         label = "刷新列表",
-        description = "重新扫描磁盘。装完插件后点一下即可看到。",
-        shape = RowShape.SINGLE,
-        onClick = onRefresh
+        description = refreshDesc,
+        shape = RowShape.TOP,
+        onClick = if (busy) null else onRefresh
     ) {
-        Text(text = "刷新", color = Fcl.ThemeText, fontSize = 12.sp)
+        Text(
+            text = if (busy) "…" else "刷新",
+            color = if (busy) Fcl.TextTertiary else Fcl.ThemeText,
+            fontSize = 12.sp
+        )
+    }
+
+    FclSettingRow(
+        label = "导出全部",
+        description = exportDesc,
+        shape = RowShape.MIDDLE,
+        onClick = if (busy) null else onExport
+    ) {
+        Text(
+            text = if (busy) "进行中" else "导出",
+            color = if (busy) Fcl.TextTertiary else Fcl.ThemeText,
+            fontSize = 12.sp
+        )
+    }
+
+    FclSettingRow(
+        label = "导入",
+        description = importDesc,
+        // 有结果行时本行要接上，圆角才不会在中间断开
+        shape = if (result.isBlank()) RowShape.BOTTOM else RowShape.MIDDLE,
+        onClick = if (busy) null else onImport
+    ) {
+        Text(
+            text = if (busy) "进行中" else "导入",
+            color = if (busy) Fcl.TextTertiary else Fcl.ThemeText,
+            fontSize = 12.sp
+        )
+    }
+
+    if (result.isNotBlank()) {
+        FclSettingRow(
+            label = result,
+            shape = RowShape.BOTTOM
+        ) {
+            Text(
+                text = if (result.startsWith("❌")) "失败" else "完成",
+                color = if (result.startsWith("❌")) Fcl.Danger else Fcl.Success,
+                fontSize = 10.sp
+            )
+        }
     }
 }
 
 /**
  * 扫描已安装插件。
  *
- * 候选顺序按「最可能是真实位置」排列，全部扫一遍而不是命中即停 ——
- * 插件可能装在不同 profile 下，用户预期是「装了的都能看到」。
+ * ## ★ 判据换成了 profile 清单，不再列 node_modules（这是真实 bug）★
+ *
+ * 旧实现对每个 profile 的 `node_modules` 无差别 listFiles，于是
+ * **插件本身和它的第三方依赖被一起当成插件列出**。用户装了 2 个插件，
+ * 页面上却出现 6 项：
+ *
+ * | 显示项 | 真实身份 |
+ * |---|---|
+ * | `dsh-whale-widget` | 插件 ✓ |
+ * | `dsh-meme` | 插件 ✓ |
+ * | `sharp` / `@img/colour` / `detect-libc` / `semver` | dsh-meme 的**依赖** ✗ |
+ *
+ * 它们不是插件，也永远不会出现在 dsh 的插件列表里 —— 用户看着一堆
+ * 自己没装过的名字，只会以为装错了东西。
+ *
+ * ## 现在的主判据
+ *
+ * `profiles/<profile>/package.json` 的 **`dsh.profile.bundles`** ——
+ * 这正是引擎启动时实际加载的 bundle 列表（dsh 自己的插件管理器也读这一项，
+ * 参考项目的 `PluginKillSwitch` / `PluginRecovery` 同样以它为准）。
+ * 里面列了什么，引擎就加载什么；没列的一律不是插件，哪怕是插件目录里
+ * 存在的包。
+ *
+ * 找不到清单（老版本/未初始化）才退回扫目录，并且只收名字像插件的包
+ * （见 [looksLikePlugin]），不再把传递依赖混进来。
+ *
+ * @param engineModules 引擎自己的 `node_modules`，用来识别「内置」bundle；
+ *   传 null 时不影响第三方插件的识别。
+ * @param marketTitles 市场索引缓存下来的「包名 → 显示名」。插件包自己的
+ *   package.json 没有显示名字段，所以取不到名字时靠这份映射兜底，
+ *   避免列表里全是 `dsh-whale-widget` 这种用户认不出的机器名。
  */
-private fun scanPlugins(dshHome: File): PluginScan {
+private fun scanPlugins(
+    dshHome: File,
+    engineModules: File?,
+    marketTitles: Map<String, String>
+): PluginScan {
     val searched = ArrayList<String>(8)
-    // 用 canonicalPath 去重：同一个包可能同时被多条候选路径命中
-    // （软链、或 profile 的 node_modules 与顶层 node_modules 指向同一处）
-    val seen = HashMap<String, PluginInfo>(16)
+    val found = LinkedHashMap<String, PluginInfo>(16)
 
-    // ⚠️ 局部函数的声明顺序有约束：Kotlin 要求先声明后使用
-    // （不像顶层函数那样可以跨文件前向引用）。所以 addPackage 必须写在
-    // addModules 之前 —— 反过来会报 `Unresolved reference: addPackage`。
-    fun addPackage(dir: File, name: String, label: String) {
-        val key = runCatching { dir.canonicalPath }.getOrDefault(dir.absolutePath)
-        if (seen.containsKey(key)) return
-        val version = readPackageVersion(dir)
-        // where 用「label + 包名」而不是绝对路径：绝对路径太长，界面上会挤成省略号
-        seen[key] = PluginInfo(name, version, dir, "$label/$name")
-    }
-
-    fun addModules(nodeModules: File, label: String) {
-        if (!nodeModules.isDirectory) return
-        val kids = runCatching { nodeModules.listFiles() }.getOrNull() ?: return
-        for (k in kids) {
-            // 跳过 .bin / .package-lock.json 之类
-            if (k.name.startsWith(".")) continue
-            if (!k.isDirectory) continue
-            if (k.name.startsWith("@")) {
-                // scope 包：磁盘上是两层目录，真正的包在下一层
-                val scoped = runCatching { k.listFiles() }.getOrNull() ?: continue
-                for (p in scoped) {
-                    if (!p.isDirectory) continue
-                    addPackage(p, "${k.name}/${p.name}", label)
-                }
-            } else {
-                addPackage(k, k.name, label)
-            }
-        }
-    }
-
-    // ① 各 profile 的 node_modules（dsh 实际解析插件的基准）
     val profiles = File(dshHome, "profiles")
-    if (profiles.isDirectory) {
-        searched.add(profiles.absolutePath)
-        val list = runCatching { profiles.listFiles() }.getOrNull().orEmpty()
-        for (p in list) {
-            if (!p.isDirectory) continue
-            val nm = File(p, "node_modules")
-            if (nm.isDirectory) {
-                searched.add(nm.absolutePath)
-                addModules(nm, "profiles/${p.name}")
-            }
+    searched.add(profiles.absolutePath)
+    val profileDirs = runCatching { profiles.listFiles() }
+        .getOrNull()
+        ?.filter { it.isDirectory && !it.name.startsWith(".") }
+        .orEmpty()
+
+    // ① 主路径：按每个 profile 的 bundles 清单逐个定位包目录
+    for (p in profileDirs) {
+        val manifest = File(p, "package.json")
+        if (!manifest.isFile) continue
+        searched.add(manifest.absolutePath)
+        val bundles = readBundles(manifest)
+        if (bundles.isEmpty()) continue
+        val nm = File(p, "node_modules")
+        if (nm.isDirectory) searched.add(nm.absolutePath)
+        for (name in bundles) {
+            if (found.containsKey(name)) continue
+            // 解析顺序与 Node 一致：profile 自己的 node_modules → profiles 顶层
+            // → 引擎目录。三处都没有，说明清单里列了但实际没装（残留条目）。
+            val dir = File(nm, name).takeIf { it.isDirectory }
+                ?: File(profiles, "node_modules/$name").takeIf { it.isDirectory }
+                ?: engineModules?.let { File(it, name) }?.takeIf { it.isDirectory }
+                ?: continue
+            found[name] = PluginInfo(
+                name = name,
+                version = readPackageVersion(dir),
+                dir = dir,
+                where = "profiles/${p.name}",
+                builtin = isBuiltinBundle(name),
+                // 先读包自己的清单；那里没有显示名（插件普遍如此）时
+                // 回落到市场索引缓存下来的名字。
+                title = readPluginTitle(dir).ifBlank { marketTitles[name].orEmpty() }
+            )
         }
-        // profile 目录下直接放 node_modules 也算
-        val top = File(profiles, "node_modules")
-        if (top.isDirectory) {
-            searched.add(top.absolutePath)
-            addModules(top, "profiles")
-        }
-    } else {
-        searched.add(profiles.absolutePath)
     }
 
-    // ② 兜底：plugins 目录（少数版本/第三方打包会用这个位置）
-    val plugins = File(dshHome, "plugins")
-    searched.add(plugins.absolutePath)
-    if (plugins.isDirectory) addModules(plugins, "plugins")
+    // ② 兜底：没有可用清单时扫目录，但只收名字像插件的包
+    if (found.isEmpty()) {
+        fun acceptFrom(nodeModules: File, label: String) {
+            if (!nodeModules.isDirectory) return
+            searched.add(nodeModules.absolutePath)
+            val kids = runCatching { nodeModules.listFiles() }.getOrNull() ?: return
+            for (k in kids) {
+                if (k.name.startsWith(".")) continue
+                if (!k.isDirectory) continue
+                if (k.name.startsWith("@")) {
+                    // scope 包：磁盘上是两层目录，真正的包在下一层
+                    val scoped = runCatching { k.listFiles() }.getOrNull() ?: continue
+                    for (s in scoped) {
+                        if (!s.isDirectory) continue
+                        val name = "${k.name}/${s.name}"
+                        if (found.containsKey(name)) continue
+                        if (!looksLikePlugin(s, name)) continue
+                        found[name] = PluginInfo(
+                            name, readPackageVersion(s), s, label,
+                            isBuiltinBundle(name),
+                            readPluginTitle(s).ifBlank { marketTitles[name].orEmpty() }
+                        )
+                    }
+                } else {
+                    if (!looksLikePlugin(k, k.name)) continue
+                    if (found.containsKey(k.name)) continue
+                    found[k.name] = PluginInfo(
+                        k.name, readPackageVersion(k), k, label, isBuiltinBundle(k.name),
+                        readPluginTitle(k).ifBlank { marketTitles[k.name].orEmpty() }
+                    )
+                }
+            }
+        }
 
-    val items = seen.values.sortedBy { it.name.lowercase(Locale.ROOT) }
+        for (p in profileDirs) acceptFrom(File(p, "node_modules"), "profiles/${p.name}")
+        acceptFrom(File(profiles, "node_modules"), "profiles")
+        val plugins = File(dshHome, "plugins")
+        searched.add(plugins.absolutePath)
+        if (plugins.isDirectory) acceptFrom(plugins, "plugins")
+    }
+
+    val items = found.values.sortedWith(
+        compareBy({ it.builtin }, { it.name.lowercase(Locale.ROOT) })
+    )
     return PluginScan(items, searched)
 }
 
+/**
+ * 读 profile 清单里的 `dsh.profile.bundles`。
+ *
+ * 这是引擎实际加载的 bundle 列表，也是判断「哪些是插件」的唯一可靠来源。
+ * 解析失败（带注释、BOM、文件半写）一律返回空表，由调用方转兜底路径。
+ */
+internal fun readBundles(manifest: File): List<String> = runCatching {
+    val text = manifest.readText().removePrefix("\uFEFF")
+    val arr = org.json.JSONObject(text)
+        .optJSONObject("dsh")
+        ?.optJSONObject("profile")
+        ?.optJSONArray("bundles")
+        ?: return@runCatching emptyList()
+    (0 until arr.length()).map { arr.optString(it) }.filter { it.isNotBlank() }
+}.getOrDefault(emptyList())
+
+/**
+ * 引擎自带、用户没装过的 bundle。它们不算「插件」，界面上单列一栏。
+ *
+ * `internal` 而非 `private`：[PluginSessionTransfer] 导出插件时要跳过它们。
+ */
+internal fun isBuiltinBundle(name: String): Boolean =
+    name.startsWith("@deepseek-ai/") ||
+        name == "dsh-web-app" ||
+        name == "dsh-app-boot"
+
+/**
+ * 兜底扫描时的「像插件」判据。
+ *
+ * 依赖包（`semver`、`sharp`、`@img/colour`、`detect-libc`…）都不带 dsh 标记，
+ * 靠这一条就能把它们挡在外面。真插件要么包名带 dsh，要么 package.json 里
+ * 带 `"dsh"` 字段。
+ */
+private fun looksLikePlugin(dir: File, name: String): Boolean {
+    if (name.contains("dsh", ignoreCase = true)) return true
+    val text = runCatching { File(dir, "package.json").readText() }.getOrNull() ?: return false
+    return text.contains("\"dsh\"")
+}
+
 /** 从包的 `package.json` 读 version；失败返回空串（列表里就不显示版本）。 */
-private fun readPackageVersion(dir: File): String = runCatching {
+internal fun readPackageVersion(dir: File): String = runCatching {
     val pkg = File(dir, "package.json")
     if (!pkg.isFile) return@runCatching ""
     // 只取 version 字段，不整体解析 —— package.json 常带注释/BOM/非法 JSON，
@@ -719,12 +1231,81 @@ private fun readPackageVersion(dir: File): String = runCatching {
         .find(pkg.readText())?.groupValues?.get(1).orEmpty()
 }.getOrDefault("")
 
+/**
+ * 从包清单里取插件的**显示名**（中文优先）。
+ *
+ * ## 为什么不能直接显示包名
+ *
+ * 包里声明的名字是 `dsh-whale-widget` 这类 npm 机器名，用户认不出是什么插件；
+ * 插件在 dsh 自己的管理器与市场里显示的名字是包内清单给的。市场索引
+ * （`plugin-market.indexes`）里每个条目的形状就是 `name`（包名）+
+ * `title: { en, zh }`（显示名），插件包内的字段与之同源。
+ *
+ * ## 候选顺序（都按「拿不到就试下一个」）
+ *
+ * 1. `title` —— 字符串，或 `{ zh, en }` 双语对象；
+ * 2. `dsh.title` / `dsh.displayName` —— 挂在 dsh 命名空间下的写法；
+ * 3. `cordis.title` / `cordis.displayName` —— 插件是 cordis 插件，另一种常见位置；
+ * 4. 顶层 `displayName`；
+ * 5. 包内的 `cordis.yml` 里的 `title:` / `displayName:` 行。
+ *
+ * 全部取不到返回空串，界面退回显示包名 —— 绝不猜、也不拿描述当名字。
+ *
+ * @param dir 插件包目录
+ */
+private fun readPluginTitle(dir: File): String {
+    val text = runCatching {
+        File(dir, "package.json").readText().removePrefix("\uFEFF")
+    }.getOrNull()
+    if (text != null) {
+        val fromJson = runCatching {
+            val o = org.json.JSONObject(text)
+            pickTitle(o.opt("title"))?.let { return@runCatching it }
+            o.optJSONObject("dsh")?.let { d ->
+                pickTitle(d.opt("title"))?.let { return@runCatching it }
+                pickTitle(d.opt("displayName"))?.let { return@runCatching it }
+            }
+            o.optJSONObject("cordis")?.let { c ->
+                pickTitle(c.opt("title"))?.let { return@runCatching it }
+                pickTitle(c.opt("displayName"))?.let { return@runCatching it }
+            }
+            pickTitle(o.opt("displayName"))
+        }.getOrNull()
+        if (!fromJson.isNullOrBlank()) return fromJson
+    }
+
+    // 包内 cordis.yml 的 title: / displayName:
+    for (name in listOf("cordis.yml", "cordis.yaml")) {
+        val f = File(dir, name)
+        if (!f.isFile) continue
+        val hit = runCatching {
+            Regex("(?m)^\\s*(?:title|displayName)\\s*:\\s*[\"']?([^\"'\\n#]+)")
+                .find(f.readText())?.groupValues?.get(1)?.trim()
+        }.getOrNull()
+        if (!hit.isNullOrBlank()) return hit
+    }
+    return ""
+}
+
+/**
+ * 从 `title` 字段的两种形状里挑出给人看的字符串。
+ *
+ * 双语对象优先 `zh`，没有中文就用 `en`；都没有返回 null。
+ */
+private fun pickTitle(v: Any?): String? = when (v) {
+    null -> null
+    is org.json.JSONObject -> v.optString("zh").ifBlank { v.optString("en") }
+        .ifBlank { v.optString("name") }.ifBlank { null }
+    is String -> v.ifBlank { null }
+    else -> null
+}
+
 // ----------------------------------------------------------------------
 // 会话管理
 // ----------------------------------------------------------------------
 
 /** 单个会话在列表里最多显示多少条（会话可能上千个，全列出来会卡）。 */
-private const val SESSION_SHOW_LIMIT = 8
+private const val SESSION_SHOW_LIMIT = 50
 
 /**
  * 一个会话。
@@ -732,13 +1313,31 @@ private const val SESSION_SHOW_LIMIT = 8
  * @param id        会话标识：有 uuid 用 uuid，否则用所在目录名
  * @param fileCount 属于它的文件数（dsh 一个会话常有 metadata + 内容两个文件）
  * @param size      这些文件的合计体积
- * @param last      最近修改时间
+ * @param last      最近活跃时间（优先取引擎记录的 lastPromptAt，退回文件 mtime）
+ * @param title     **dsh 给这个会话总结的名字**。之前完全不读它，列表里只有
+ *   `2a1059c6` 这种 uuid 尾号，用户根本认不出哪个会话是哪个。
  */
 private data class SessionInfo(
     val id: String,
     val fileCount: Int,
     val size: Long,
-    val last: Long
+    val last: Long,
+    val title: String = ""
+)
+
+/**
+ * 会话投影缓存里的一条元信息。
+ *
+ * dsh 把会话状态写在 `$DSH_HOME/storages/session_projcache/sessions/<id>.json`，
+ * 是**明文 JSON**（不像 `session.v4.jsonl.zstd` 要先解压），体积几 KB，
+ * 而且随活动实时更新 —— 标题与活跃时间都在里面。
+ *
+ * @param title        引擎算好的标题（没有时退回首条用户消息）
+ * @param lastPromptAt 最后一次提问时间；为 0 表示这条缓存里没记
+ */
+private data class ProjMeta(
+    val title: String = "",
+    val lastPromptAt: Long = 0L
 )
 
 /** 会话扫描结果：列表 + 实际扫描位置（扫描位置要显示出来，便于核对）。 */
@@ -778,69 +1377,451 @@ private data class SessionScan(
  * 3. 体积与时间按聚合后计算，不再逐个文件相加。
  */
 @Composable
-private fun SessionTab(dshHome: File, tick: Int, onRefresh: () -> Unit) {
+private fun SessionTab(
+    dshHome: File,
+    tick: Int,
+    onRefresh: () -> Unit,
+    onExport: () -> Unit,
+    onImport: () -> Unit,
+    onExportSession: (String) -> Unit
+) {
+    val context = LocalContext.current
     val scan = remember(tick) { scanSessions(dshHome) }
     val sessions = scan.items
     val totalSize = remember(tick) { sessions.sumOf { it.size } }
 
-    FclSettingSection("会话")
+    // 订阅忙碌状态：导出进行中时行内的「导出」按钮要真的点不动
+    val busy = PluginSessionTransfer.busy
 
-    if (sessions.isEmpty()) {
-        EmptyState(
-            title = "还没有会话记录",
-            detail = "在 dsh 里聊过一次之后，会话会落在这个数据目录下。"
-        )
-    } else {
-        FclSettingRow(
-            label = "共 ${sessions.size} 个会话",
-            description = "合计 ${humanSize(totalSize)}。只读展示，删除请用 dsh 自己的界面。",
-            shape = if (sessions.size > SESSION_SHOW_LIMIT) RowShape.TOP else RowShape.SINGLE
-        ) {
-            Text(text = "只读", color = Fcl.TextTertiary, fontSize = 10.sp)
-        }
+    // 待确认删除的会话。会话删了找不回来，必须二次确认。
+    var pendingDelete by remember { mutableStateOf<SessionInfo?>(null) }
+    val main = remember { Handler(Looper.getMainLooper()) }
 
-        if (sessions.size > SESSION_SHOW_LIMIT) {
-            // 按修改时间倒序展示最近几个，长列表留给文件管理器
-            val recent = sessions.sortedByDescending { it.last }.take(SESSION_SHOW_LIMIT)
-            recent.forEachIndexed { i, s ->
-                FclSettingRow(
-                    label = s.id,
-                    description = timeText(s.last) + " · " + humanSize(s.size) +
-                        if (s.fileCount > 1) " · ${s.fileCount} 个文件" else "",
-                    shape = RowShape.of(i, recent.size)
-                ) {
-                    Text(text = "最近", color = Fcl.TextTertiary, fontSize = 10.sp)
+    SplitPane(
+        left = {
+            // ── 能操作的：全部集中在左栏顶部 ──
+            TransferActions(
+                kind = PluginSessionTransfer.Kind.SESSIONS,
+                refreshDesc = "重新扫描数据目录。",
+                exportDesc = "全部会话打成 zip（含标题缓存）。",
+                importDesc = "写入数据目录，已存在的会话跳过、不覆盖。",
+                onRefresh = onRefresh,
+                onExport = onExport,
+                onImport = onImport
+            )
+
+            // ── 以下只读、不能操作，按要求放在左栏下方 ──
+            Spacer(modifier = Modifier.height(6.dp))
+            FclSettingSection("统计")
+            FclSettingRow(
+                label = "共 ${sessions.size} 个会话",
+                description = "合计 ${humanSize(totalSize)}。可在右侧逐项删除。",
+                shape = RowShape.SINGLE
+            ) {
+                Text(text = "只读", color = Fcl.TextTertiary, fontSize = 10.sp)
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            FclSettingSection("扫描位置")
+            val rootExists = remember(scan.root) { File(scan.root).isDirectory }
+            FclSettingRow(
+                label = if (rootExists) "已存在" else "不存在",
+                description = scan.root,
+                shape = RowShape.SINGLE
+            ) {
+                Text(
+                    text = if (rootExists) "✓" else "—",
+                    color = if (rootExists) Fcl.Success else Fcl.TextTertiary,
+                    fontSize = 11.sp
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+        },
+        right = {
+            FclSettingSection("会话（${sessions.size}）")
+
+            if (sessions.isEmpty()) {
+                EmptyState(
+                    title = "还没有会话记录",
+                    detail = "在 dsh 里聊过一次之后，会话会落在这个数据目录下。"
+                )
+            } else {
+                // ★ 这里以前是 `if (sessions.size > SESSION_SHOW_LIMIT)` 才列明细 ★
+                //
+                // 上限是 8，于是**会话不超过 8 个时一行明细都不渲染**，界面上只剩
+                // 一句「共 N 个会话」—— 用户看到的就是「只显示数量、看不到每个会话」。
+                // 现在无条件列出（截断到上限，超出时补一行说明），并且用标题而不是 uuid。
+                //
+                // 「共 N 个会话」那行已移到左栏的「统计」里，所以这里的圆角
+                // 直接按列表本身的行数算，不再额外 +1。
+                val shown = sessions.take(SESSION_SHOW_LIMIT)
+                val moreCount = sessions.size - shown.size
+                val totalRows = shown.size + if (moreCount > 0) 1 else 0
+
+                shown.forEachIndexed { i, s ->
+                    val named = s.title.isNotBlank()
+                    FclSettingRow(
+                        // 标题是第一眼要看到的东西，放在 label；uuid 退到描述里备用
+                        label = if (named) s.title else s.id,
+                        description = (if (named) "${s.id} · " else "") +
+                            timeText(s.last) + " · " + humanSize(s.size) +
+                            if (s.fileCount > 1) " · ${s.fileCount} 个文件" else "",
+                        shape = RowShape.of(i, totalRows)
+                    ) {
+                        Text(
+                            text = if (named) "已总结" else "未命名",
+                            color = if (named) Fcl.Success else Fcl.TextTertiary,
+                            fontSize = 10.sp
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        // 单项导出：只打这一个会话（本体 + 标题缓存），
+                        // 适合单独分享某段对话，不用把全部会话搬出去。
+                        RowAction(
+                            text = "导出",
+                            enabled = !busy,
+                            onClick = { onExportSession(s.id) }
+                        )
+                        Spacer(modifier = Modifier.width(2.dp))
+                        // 删除：本体文件 + 标题缓存一起删。先弹确认窗。
+                        RowAction(
+                            text = "删除",
+                            enabled = !busy,
+                            danger = true,
+                            onClick = { pendingDelete = s }
+                        )
+                    }
                 }
+
+                if (moreCount > 0) {
+                    FclSettingRow(
+                        label = "还有 $moreCount 个会话未显示",
+                        description = "只列最近 $SESSION_SHOW_LIMIT 个，长列表留给文件管理器。",
+                        shape = RowShape.of(totalRows - 1, totalRows)
+                    ) {
+                        Text(text = "…", color = Fcl.TextTertiary, fontSize = 10.sp)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+        }
+    )
+
+    // 删除确认窗。放在 SplitPane 之后：覆盖层不参与分栏布局。
+    pendingDelete?.let { target ->
+        ConfirmDialog(
+            title = "删除会话「${target.title.ifBlank { target.id }}」",
+            detail = "将删除这个会话的本体文件与标题缓存（${target.fileCount} 个文件，" +
+                "${humanSize(target.size)}）。重启实例后彻底消失。" +
+                "此操作不可撤销，建议先「导出」备份。",
+            onDismiss = { pendingDelete = null },
+            onConfirm = {
+                val key = target.id
+                pendingDelete = null
+                Thread {
+                    PluginSessionTransfer.deleteSession(context, key)
+                    main.post { onRefresh() }
+                }.start()
+            }
+        )
+    }
+}
+
+// ----------------------------------------------------------------------
+// skill 管理
+// ----------------------------------------------------------------------
+
+/**
+ * 一个已安装的 skill。
+ *
+ * @param id   目录名（skill 的身份）
+ * @param path 相对 `DSH_HOME` 的位置，便于用户核对
+ * @param dir  实际目录，删除时用
+ */
+internal data class SkillInfo(
+    val id: String,
+    val path: String,
+    val dir: File,
+    val fileCount: Int,
+    val size: Long,
+    /** 从 SKILL.md / README.md 里读到的标题；读不到为空串。 */
+    val title: String
+)
+
+/**
+ * skill 扫描结果：列表 + 实际扫过的位置（扫描位置要显示出来便于核对）。
+ *
+ * `internal` 而非 `private`：「skill 下载」页也要列已装 skill，
+ * 两处共用同一个扫描函数，避免「设置页能看到、下载页看不到」这种分叉。
+ */
+internal data class SkillScan(
+    val items: List<SkillInfo>,
+    val searched: List<String>
+)
+
+/**
+ * skill 管理：扫描并删除已安装的 skill。
+ *
+ * ## 为什么扫多条候选路径
+ *
+ * dsh 的 skill 存放位置随版本/插件而变（有的版本在 `$DSH_HOME/skills`，
+ * 有的在 profile 下，`@michengai/dsh-skills-manager` 这类插件还会自己建目录）。
+ * 与其赌一条路径，不如把几条候选全扫一遍，并在界面上把**实际扫过的位置**
+ * 摊开 —— 万一一个都没扫到，用户能立刻看出该补哪条路径，而不是干瞪眼。
+ *
+ * ## skill 的身份是「目录」
+ *
+ * 一个 skill 就是一个目录（里面通常有 SKILL.md）。所以按目录认身份，
+ * 不按文件 —— 这与会话完全不同（会话是「一堆文件算一条」）。
+ */
+@Composable
+private fun SkillTab(
+    dshHome: File,
+    tick: Int,
+    onRefresh: () -> Unit,
+    onExport: () -> Unit,
+    onImport: () -> Unit,
+    onExportSkill: (String, String) -> Unit
+) {
+    val scan = remember(tick) { scanSkills(dshHome) }
+    val skills = scan.items
+
+    var pendingDelete by remember { mutableStateOf<SkillInfo?>(null) }
+    val main = remember { Handler(Looper.getMainLooper()) }
+
+    // 删除进行中：防止连点两次同时删同一个目录
+    var deleting by remember { mutableStateOf(false) }
+
+    SplitPane(
+        left = {
+            // 刷新 / 导出全部 / 导入 —— 与插件页、会话页同一套组件，
+            // 靠 kind 区分操作结果，避免「导出 skill 后切到插件页看到这条结果」。
+            TransferActions(
+                kind = PluginSessionTransfer.Kind.SKILLS,
+                refreshDesc = "重新扫描磁盘，装完 skill 后点这里。",
+                exportDesc = "全部 skill 打成 zip，保留原始目录结构。",
+                importDesc = "解包写回原位置，已存在的文件跳过。",
+                onRefresh = onRefresh,
+                onExport = onExport,
+                onImport = onImport
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+            FclSettingSection("扫描位置")
+            if (scan.searched.isEmpty()) {
+                EmptyState(title = "没有可扫描的目录", detail = "数据目录尚未创建。")
+            } else {
+                scan.searched.forEachIndexed { i, path ->
+                    val exists = remember(path) { File(path).isDirectory }
+                    FclSettingRow(
+                        label = if (exists) "已存在" else "不存在",
+                        description = path,
+                        shape = RowShape.of(i, scan.searched.size)
+                    ) {
+                        Text(
+                            text = if (exists) "✓" else "—",
+                            color = if (exists) Fcl.Success else Fcl.TextTertiary,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            FclSettingSection("说明")
+            FclSettingRow(
+                label = "什么是 skill",
+                description = "skill 是给 Agent 用的可复用指令包，一个目录一个 skill，" +
+                    "通常带 SKILL.md。删除后需要重新安装。",
+                shape = RowShape.SINGLE
+            ) {
+                Text(text = "只读", color = Fcl.TextTertiary, fontSize = 10.sp)
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+        },
+        right = {
+            FclSettingSection("已安装 skill（${skills.size}）")
+
+            if (skills.isEmpty()) {
+                EmptyState(
+                    title = "没有找到 skill",
+                    detail = "在左侧列出的位置都没扫到 skill 目录。" +
+                        "若确认已安装，请把真实路径告知开发者以补上扫描位置。"
+                )
+            } else {
+                skills.forEachIndexed { i, s ->
+                    FclSettingRow(
+                        label = s.title.ifBlank { s.id },
+                        description = buildString {
+                            append(s.path)
+                            append(" · ${s.fileCount} 个文件")
+                            append(" · ${humanSize(s.size)}")
+                        },
+                        shape = RowShape.SINGLE
+                    ) {
+                        // 单项导出：只打这一个 skill 目录。
+                        // label 是它所在的那条根目录（`skills` / `profiles/x/skills`），
+                        // 同名 skill 装在多处时靠它精确找回，不会打错那个。
+                        RowAction(
+                            text = "导出",
+                            enabled = !PluginSessionTransfer.busy,
+                            onClick = {
+                                onExportSkill(s.id, s.path.substringBeforeLast('/'))
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(2.dp))
+                        RowAction(
+                            text = "删除",
+                            enabled = !deleting,
+                            danger = true,
+                            onClick = { pendingDelete = s }
+                        )
+                    }
+                    if (i < skills.size - 1) Spacer(modifier = Modifier.height(4.dp))
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+        }
+    )
+
+    pendingDelete?.let { target ->
+        ConfirmDialog(
+            title = "删除 skill「${target.title.ifBlank { target.id }}」",
+            detail = "将删除目录 ${target.path}（${target.fileCount} 个文件，" +
+                "${humanSize(target.size)}）。此操作不可撤销。",
+            onDismiss = { pendingDelete = null },
+            onConfirm = {
+                val dir = target.dir
+                pendingDelete = null
+                deleting = true
+                Thread {
+                    val ok = deleteSkillDir(dir)
+                    main.post {
+                        deleting = false
+                        onRefresh()
+                    }
+                    if (!ok) DSHRunner.onLog("❌ 删除 skill 失败: ${dir.absolutePath}")
+                }.start()
+            }
+        )
+    }
+}
+
+/**
+ * 删除一个 skill 目录。
+ *
+ * ## 软链只删链接本身
+ *
+ * 与插件删除同一条铁律：对指向别处的软链做 `deleteRecursively()` 会顺着链接
+ * 把外部目录一起删掉，且不可恢复。所以先用 [com.isLink] 判断，
+ * 链接只 `delete()`，真实目录才递归删。
+ */
+private fun deleteSkillDir(dir: File): Boolean = runCatching {
+    if (com.isLink(dir)) dir.delete() else dir.deleteRecursively()
+}.getOrDefault(false)
+
+/**
+ * 扫描 skill。
+ *
+ * 候选路径按「最可能」排列，**全部扫一遍而不是命中即停** ——
+ * skill 可能同时装在全局与 profile 两处。
+ */
+internal fun scanSkills(dshHome: File): SkillScan {
+    val searched = ArrayList<String>(8)
+    val found = LinkedHashMap<String, SkillInfo>(16)
+
+    // canonicalPath 去重：同一目录可能被多条候选路径命中
+    val seen = HashSet<String>(16)
+
+    // ⚠️ 局部函数必须先声明后使用（Kotlin 的硬约束）
+    fun acceptBase(base: File, label: String) {
+        if (!base.isDirectory) return
+        searched.add(base.absolutePath)
+        val kids = runCatching { base.listFiles() }.getOrNull() ?: return
+        for (d in kids) {
+            if (!d.isDirectory) continue
+            // 跳过隐藏目录与明显的元数据目录
+            if (d.name.startsWith(".")) continue
+            if (d.name == "node_modules") continue
+            val key = runCatching { d.canonicalPath }.getOrDefault(d.absolutePath)
+            if (!seen.add(key)) continue
+
+            var files = 0
+            var size = 0L
+            val stack = ArrayDeque<File>()
+            stack.addLast(d)
+            while (stack.isNotEmpty()) {
+                val cur = stack.removeLast()
+                val children = runCatching { cur.listFiles() }.getOrNull() ?: continue
+                for (f in children) {
+                    if (com.isLink(f)) continue
+                    if (f.isDirectory) {
+                        stack.addLast(f)
+                    } else {
+                        files++
+                        size += runCatching { f.length() }.getOrDefault(0L)
+                    }
+                }
+            }
+
+            found[d.name] = SkillInfo(
+                id = d.name,
+                path = "$label/${d.name}",
+                dir = d,
+                fileCount = files,
+                size = size,
+                title = readSkillTitle(d)
+            )
+        }
+    }
+
+    // ① 数据目录顶层（多数版本把 skill 放在这里）
+    acceptBase(File(dshHome, "skills"), "skills")
+
+    // ② 各 profile 下（插件管理器装的 skill 常落在这里）
+    val profiles = File(dshHome, "profiles")
+    val profileDirs = runCatching { profiles.listFiles() }
+        .getOrNull()
+        ?.filter { it.isDirectory && !it.name.startsWith(".") }
+        .orEmpty()
+    for (p in profileDirs) {
+        acceptBase(File(p, "skills"), "profiles/${p.name}/skills")
+    }
+
+    // ③ Claude 风格的 `.claude/skills`（部分 skill 直接复用生态格式）
+    acceptBase(File(dshHome, ".claude/skills"), ".claude/skills")
+
+    val items = found.values.sortedBy { it.id.lowercase(Locale.ROOT) }
+    return SkillScan(items, searched)
+}
+
+/**
+ * 从 skill 目录里读显示名。
+ *
+ * 优先取 `SKILL.md` / `skill.md` 的第一个 `# 标题`，
+ * 其次 `README.md` 的同名字段。都读不到返回空串，界面回落到目录名。
+ */
+private fun readSkillTitle(dir: File): String {
+    for (name in listOf("SKILL.md", "skill.md", "README.md", "readme.md")) {
+        val f = File(dir, name)
+        if (!f.isFile) continue
+        val text = runCatching { f.readText() }.getOrNull() ?: continue
+        // 只看前 40 行：标题一定在前面，读整个文件没必要
+        val head = text.lineSequence().take(40)
+        for (line in head) {
+            val t = line.trim()
+            if (t.startsWith("# ")) return t.removePrefix("# ").trim()
+            // YAML front matter 里的 name: 也认
+            if (t.startsWith("name:")) {
+                val v = t.removePrefix("name:").trim().trim('"', '\'')
+                if (v.isNotEmpty()) return v
             }
         }
     }
-
-    Spacer(modifier = Modifier.height(8.dp))
-
-    FclSettingSection("扫描位置")
-    val rootExists = remember(scan.root) { File(scan.root).isDirectory }
-    FclSettingRow(
-        label = if (rootExists) "已存在" else "不存在",
-        description = scan.root,
-        shape = RowShape.SINGLE
-    ) {
-        Text(
-            text = if (rootExists) "✓" else "—",
-            color = if (rootExists) Fcl.Success else Fcl.TextTertiary,
-            fontSize = 11.sp
-        )
-    }
-
-    Spacer(modifier = Modifier.height(8.dp))
-    FclSettingSection("操作")
-    FclSettingRow(
-        label = "刷新列表",
-        description = "重新扫描数据目录。",
-        shape = RowShape.SINGLE,
-        onClick = onRefresh
-    ) {
-        Text(text = "刷新", color = Fcl.ThemeText, fontSize = 12.sp)
-    }
+    return ""
 }
 
 /**
@@ -848,7 +1829,7 @@ private fun SessionTab(dshHome: File, tick: Int, onRefresh: () -> Unit) {
  *
  * 这几类都在 `sessions/` 下真实存在，是旧实现把会话数虚高的直接原因。
  */
-private fun isNotSessionPayload(name: String): Boolean {
+internal fun isNotSessionPayload(name: String): Boolean {
     val n = name.lowercase(Locale.ROOT)
     return n.contains(".lock") ||          // session.lock.dsh-lock
         n.contains(".dsh-lock") ||
@@ -858,8 +1839,29 @@ private fun isNotSessionPayload(name: String): Boolean {
 }
 
 /** 从文件名里抽 uuid（会话 metadata 常见命名：`session-<uuid>.json`）。 */
-private val SESSION_UUID_RE =
+internal val SESSION_UUID_RE =
     Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+/**
+ * 一个文件属于哪个会话 —— **导出单个会话时必须与列表用同一套判据**。
+ *
+ * 若这里和 [scanSessions] 各写一份，就会出现「列表里能选、导出却说找不到」：
+ * 两处对同一个会话算出了不同的 key。所以抽成一个函数，双方都调它。
+ *
+ * 判定顺序：
+ *  · 在 `sessions/<id>/` 这类子目录里 → 用目录名（一个会话一个目录）；
+ *  · 平铺在 `sessions/` 下 → 用文件名里的 uuid；
+ *  · 两者都没有 → 退回文件名去扩展名。
+ *
+ * @param scanFrom 扫描根（`sessions/`，不存在时是数据根）
+ */
+internal fun sessionKeyOf(f: File, scanFrom: File): String {
+    val parent = f.parentFile
+    return when {
+        parent != null && parent.absolutePath != scanFrom.absolutePath -> parent.name
+        else -> SESSION_UUID_RE.find(f.name)?.value ?: f.name.substringBeforeLast('.')
+    }
+}
 
 /**
  * 扫描会话。
@@ -881,18 +1883,9 @@ private fun scanSessions(root: File): SessionScan {
         if (!f.name.contains("session", ignoreCase = true)) return
         files++
 
-        val parent = f.parentFile
-        // 身份判定：
-        //  · 在 sessions/<id>/ 这种子目录里 → 用目录路径（一个会话一个目录）
-        //  · 直接平铺在 sessions/ 下 → 用文件名里的 uuid
-        //  · 两者都没有 → 退回文件名去扩展名
-        val key: String = when {
-            parent != null && parent.absolutePath != scanFrom.absolutePath ->
-                parent.name
-
-            else -> SESSION_UUID_RE.find(f.name)?.value
-                ?: f.name.substringBeforeLast('.')
-        }
+        // 身份判定统一走 sessionKeyOf：导出单个会话时用的是同一个函数，
+        // 两处若各写一份，会出现「列表里能选、导出却说找不到」。
+        val key: String = sessionKeyOf(f, scanFrom)
 
         val size = runCatching { f.length() }.getOrDefault(0L)
         val time = runCatching { f.lastModified() }.getOrDefault(0L)
@@ -919,84 +1912,460 @@ private fun scanSessions(root: File): SessionScan {
 
     if (scanFrom.isDirectory) walk(scanFrom, 0)
 
+    // 标题与活跃时间从投影缓存补上。
+    //
+    // ★ 为什么必须走这份缓存，而不是读 session.v4.jsonl.zstd ★
+    //   · 那个文件是 zstd 压缩的，Kotlin 侧要解压得多引一个依赖；
+    //   · 更关键的是它**只在建会话时写一次**，mtime 会永久停在建会话那一刻，
+    //     拿它当「最近活跃」是错的。
+    //   投影缓存是明文 JSON、随活动更新，标题（引擎自己总结的名字）也在里面。
+    val metas = readProjCache(root)
+
+    fun metaOf(id: String): ProjMeta? {
+        val norm = id.lowercase(Locale.ROOT)
+        metas[norm.removePrefix("session-")]?.let { return it }
+        // 聚合用的 key 有时是目录名、有时是裸 uuid，两边都得能对上
+        SESSION_UUID_RE.find(norm)?.let { m -> metas[m.value]?.let { return it } }
+        return null
+    }
+
     val items = groups.entries
-        .map { SessionInfo(it.key, it.value.first, it.value.second, it.value.third) }
+        .map { (key, v) ->
+            val meta = metaOf(key)
+            SessionInfo(
+                id = key,
+                fileCount = v.first,
+                size = v.second,
+                // 有 lastPromptAt 就用它（比文件 mtime 准），否则退回 mtime
+                last = meta?.lastPromptAt?.takeIf { it > 0L } ?: v.third,
+                title = meta?.title.orEmpty()
+            )
+        }
         .sortedByDescending { it.last }
     return SessionScan(items, scanFrom.absolutePath)
 }
+
+/**
+ * 读会话投影缓存：`$DSH_HOME/storages/session_projcache/sessions/<id>.json`。
+ *
+ * 返回 `去掉 session- 前缀的小写 id → 元信息`。目录不存在时返回空表，
+ * 列表会退回显示 uuid 尾号（不报错、不影响其它内容）。
+ */
+private fun readProjCache(root: File): Map<String, ProjMeta> {
+    val dir = File(root, "storages/session_projcache/sessions")
+    if (!dir.isDirectory) return emptyMap()
+    val files = runCatching { dir.listFiles() }.getOrNull() ?: return emptyMap()
+    val out = HashMap<String, ProjMeta>(files.size.coerceAtLeast(8))
+    for (f in files) {
+        if (!f.isFile || !f.name.endsWith(".json")) continue
+        val id = f.name.removeSuffix(".json")
+            .removePrefix("session-")
+            .lowercase(Locale.ROOT)
+        out[id] = readProjMeta(f)
+    }
+    return out
+}
+
+/**
+ * 解析单条投影缓存。
+ *
+ * 数据形状：`record.rows.<字段>.val`，其中 `title` 的 val 可能是字符串，
+ * `titleInput` / `sessionListMetadata` 的 val 是对象 —— 两种都按「拿不到就用空」处理，
+ * 因为这份格式没有版本承诺，缺字段不该让整页崩掉。
+ */
+private fun readProjMeta(f: File): ProjMeta = runCatching {
+    val text = f.readText().removePrefix("\uFEFF")
+    val rows = org.json.JSONObject(text)
+        .optJSONObject("record")
+        ?.optJSONObject("rows")
+        ?: return@runCatching ProjMeta()
+
+    fun objVal(key: String): org.json.JSONObject? =
+        rows.optJSONObject(key)?.optJSONObject("val")
+
+    val rawTitle = rows.optJSONObject("title")?.opt("val")?.toString().orEmpty()
+    val title = if (rawTitle.isBlank() || rawTitle == "null") "" else rawTitle
+    // 引擎还没总结出标题时，用首条用户消息兜底 —— 也比 uuid 强
+    val firstPrompt = objVal("titleInput")?.optString("first").orEmpty()
+
+    ProjMeta(
+        title = title.ifBlank { firstPrompt },
+        lastPromptAt = objVal("sessionListMetadata")?.optLong("lastPromptAt", 0L) ?: 0L
+    )
+}.getOrDefault(ProjMeta())
 
 // ----------------------------------------------------------------------
 // mcp 管理
 // ----------------------------------------------------------------------
 
 /**
- * mcp 管理：读 `DSH_HOME` 下的 mcp 配置文件，列出里面登记的服务名。
+ * mcp 管理：读 `DSH_HOME` 下的 MCP 配置文件，列出里面登记的服务。
  *
- * 只解析 `servers` / `mcpServers` 里的键名 —— 用 Android 自带的
- * `org.json` 就够，不额外引依赖。解析失败（`.jsonc` 带注释之类）时
- * 只报告"文件存在"，不硬猜内容。
+ * ## 这一版修的三个「看起来能用、实际不能用」的问题
+ *
+ * 1. **`.jsonc` 永远解析失败** —— `org.json` 不认注释，而 dsh 的不少配置
+ *    是带注释的 JSONC。旧实现遇到注释就只报「文件存在」，
+ *    等于该页对这类文件完全失效。现在先剥注释再解析。
+ * 2. **只认 4 条硬编码路径** —— 实际存放位置随版本/插件而变。
+ *    现在加上 profile 目录与有界搜索。
+ * 3. **找不到时不给任何线索** —— 现在把**实际扫过的位置**摊开，
+ *    扫不到时用户能立刻看出该补哪条路径，而不是干瞪眼。
+ *
+ * ## 支持的配置形状
+ *
+ * ```
+ * { "mcpServers": { "名字": { "command": ... } } }
+ * { "servers":    { "名字": { "url": ... } } }
+ * { "servers":    [ { "name": "名字", ... } ] }
+ * [ { "name": "名字", ... } ]
+ * ```
+ *
+ * 四种都在真实生态里出现过。认不出时如实报「没有登记任何服务」，
+ * 不硬猜内容。
  */
 @Composable
-private fun McpTab(dshHome: File, tick: Int, onRefresh: () -> Unit) {
-    val found = remember(tick) { lookupMcpConfig(dshHome) }
+private fun McpTab(
+    dshHome: File,
+    tick: Int,
+    onRefresh: () -> Unit,
+    onExport: () -> Unit,
+    onImport: () -> Unit,
+    onExportMcpConfig: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val scan = remember(tick) { scanMcpConfigs(dshHome) }
+    val totalServers = remember(tick) { scan.configs.sumOf { it.servers.size } }
 
-    FclSettingSection("MCP")
+    // 待确认的删除目标。两种粒度：
+    //  · 删单个服务（经典 JSON 里摘一条）
+    //  · 删整份配置（bundle 就是卸载整个包）
+    var pendingServer by remember { mutableStateOf<Pair<McpConfig, String>?>(null) }
+    var pendingConfig by remember { mutableStateOf<McpConfig?>(null) }
 
-    if (found == null) {
-        EmptyState(
-            title = "还没有 MCP 配置",
-            detail = "在 dsh 里添加 MCP 服务后，配置会出现在这个数据目录下。"
-        )
-    } else {
-        val (file, servers, parseError) = found
-        FclSettingRow(
-            label = file.name,
-            description = file.absolutePath,
-            shape = if (servers.isEmpty()) RowShape.SINGLE else RowShape.TOP
-        ) {
-            Text(text = sizeText(file), color = Fcl.TextTertiary, fontSize = 10.sp)
-        }
+    // 删盘是阻塞 IO，必须离开主线程；完成后回主线程刷新。
+    var deleting by remember { mutableStateOf(false) }
+    val main = remember { Handler(Looper.getMainLooper()) }
 
-        if (parseError != null) {
+    SplitPane(
+        left = {
+            // 刷新 / 导出全部 / 导入。bundle 形式的 MCP 导出时会把同目录的
+            // mcp-server.mjs / launch-mcp.sh 一起打进去 —— 只打 yml 等于导空壳。
+            TransferActions(
+                kind = PluginSessionTransfer.Kind.MCP,
+                refreshDesc = "重新读取 MCP 配置。",
+                exportDesc = "全部 MCP 配置打成 zip，bundle 会连同脚本一起打包。",
+                importDesc = "解包写回原路径，已存在的文件跳过。",
+                onRefresh = onRefresh,
+                onExport = onExport,
+                onImport = onImport
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+            FclSettingSection("统计")
             FclSettingRow(
-                label = "无法解析配置",
-                description = parseError,
-                shape = RowShape.BOTTOM
+                label = "${scan.configs.size} 个配置文件",
+                description = "共 $totalServers 个已登记的服务。" +
+                    "可在右侧逐项删除；删除前会自动备份配置文件。",
+                shape = RowShape.SINGLE
             ) {
-                Text(text = "—", color = Fcl.TextTertiary, fontSize = 10.sp)
+                Text(text = "可删", color = Fcl.Success, fontSize = 10.sp)
             }
-        } else if (servers.isNotEmpty()) {
-            servers.forEachIndexed { i, name ->
-                FclSettingRow(
-                    label = name,
-                    description = "已登记的服务",
-                    shape = RowShape.of(i + 1, servers.size + 1)
-                ) {
-                    Text(text = "启用", color = Fcl.Success, fontSize = 10.sp)
+
+            Spacer(modifier = Modifier.height(6.dp))
+            FclSettingSection("扫描位置")
+            if (scan.searched.isEmpty()) {
+                EmptyState(title = "没有可扫描的目录", detail = "数据目录尚未创建。")
+            } else {
+                scan.searched.forEachIndexed { i, path ->
+                    val exists = remember(path) { File(path).isFile }
+                    FclSettingRow(
+                        label = if (exists) "已存在" else "不存在",
+                        description = path,
+                        shape = RowShape.of(i, scan.searched.size)
+                    ) {
+                        Text(
+                            text = if (exists) "✓" else "—",
+                            color = if (exists) Fcl.Success else Fcl.TextTertiary,
+                            fontSize = 11.sp
+                        )
+                    }
                 }
             }
-        } else {
-            FclSettingRow(
-                label = "没有登记任何服务",
-                description = "配置文件存在，但 servers 列表是空的。",
-                shape = RowShape.BOTTOM
-            ) {
-                Text(text = "空", color = Fcl.TextTertiary, fontSize = 10.sp)
+
+            Spacer(modifier = Modifier.height(10.dp))
+        },
+        right = {
+            FclSettingSection("MCP 服务")
+
+            if (scan.configs.isEmpty()) {
+                EmptyState(
+                    title = "还没有 MCP 配置",
+                    detail = "左侧列出的位置都没找到 MCP 配置。装好后会出现在这里。"
+                )
+            } else {
+                scan.configs.forEach { cfg ->
+                    FclSettingRow(
+                        label = cfg.rel.substringAfterLast('/'),
+                        description = buildString {
+                            append(cfg.rel)
+                            if (cfg.parseError != null) {
+                                append("\n⚠️ ${cfg.parseError}")
+                            } else if (cfg.servers.isEmpty()) {
+                                append("\n配置文件存在，但没有登记任何服务")
+                            } else {
+                                append("\n${cfg.servers.size} 个服务")
+                            }
+                        },
+                        shape = RowShape.SINGLE
+                    ) {
+                        // bundle 形式标出来：用户一眼能分清「经典 mcp.json」
+                        // 与「local-plugins 里的 MCP bundle」
+                        if (cfg.bundle) {
+                            Text(
+                                text = "bundle",
+                                color = Fcl.ThemeText,
+                                fontSize = 10.sp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        } else {
+                            Text(
+                                text = sizeText(cfg.file),
+                                color = Fcl.TextTertiary,
+                                fontSize = 10.sp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        // 单项导出：bundle 会把同目录脚本一起打进去
+                        RowAction(
+                            text = "导出",
+                            enabled = !PluginSessionTransfer.busy && !deleting,
+                            onClick = { onExportMcpConfig(cfg.rel) }
+                        )
+                        Spacer(modifier = Modifier.width(2.dp))
+                        // 整份删掉：bundle 相当于「卸载这个 MCP 包」，
+                        // 经典配置则是删掉整个 mcp.json
+                        RowAction(
+                            text = if (cfg.bundle) "卸载" else "删除",
+                            enabled = !deleting,
+                            danger = true,
+                            onClick = { pendingConfig = cfg }
+                        )
+                    }
+
+                    if (cfg.parseError == null && cfg.servers.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        cfg.servers.forEachIndexed { i, s ->
+                            FclSettingRow(
+                                label = s.name,
+                                description = s.detail.ifBlank { "已登记的服务" },
+                                shape = RowShape.SINGLE
+                            ) {
+                                Text(text = "启用", color = Fcl.Success, fontSize = 10.sp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                // 删单个服务只对经典 JSON 有效：bundle 的配置
+                                // 和它自己的脚本是一体的，摘一条没法真正卸载，
+                                // 所以那种情况只给「卸载」。
+                                if (!cfg.bundle) {
+                                    RowAction(
+                                        text = "删除",
+                                        enabled = !deleting,
+                                        danger = true,
+                                        onClick = { pendingServer = cfg to s.name }
+                                    )
+                                }
+                            }
+                            if (i < cfg.servers.size - 1) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
             }
+
+            Spacer(modifier = Modifier.height(10.dp))
+        }
+    )
+
+    // ── 删单个服务 ──────────────────────────────────────────────────
+    pendingServer?.let { (cfg, name) ->
+        ConfirmDialog(
+            title = "删除 MCP 服务「$name」",
+            detail = "将从 ${cfg.rel} 里移除这一项。配置文件会先备份成 " +
+                "${cfg.file.name}.bak-delete。\n\n" +
+                "注意：写回时会丢掉原文件里的注释（JSON 不支持注释）。",
+            onDismiss = { pendingServer = null },
+            onConfirm = {
+                pendingServer = null
+                deleting = true
+                Thread {
+                    val ok = removeServerFromConfig(cfg, name)
+                    main.post {
+                        deleting = false
+                        if (ok) {
+                            DSHRunner.onLog("✅ 已删除 MCP 服务 $name（${cfg.rel}）")
+                        } else {
+                            DSHRunner.onLog("❌ 删除 MCP 服务失败: ${cfg.rel}")
+                        }
+                        onRefresh()
+                    }
+                }.start()
+            }
+        )
+    }
+
+    // ── 删整份配置 / 卸载 bundle ────────────────────────────────────
+    pendingConfig?.let { cfg ->
+        ConfirmDialog(
+            title = if (cfg.bundle) {
+                "卸载 MCP bundle「${cfg.file.parentFile?.name ?: cfg.rel}」"
+            } else {
+                "删除配置文件 ${cfg.rel.substringAfterLast('/')}"
+            },
+            detail = if (cfg.bundle) {
+                "将删除整个包目录（cordis.patch.yml、mcp-server.mjs、launch-mcp.sh 等），" +
+                    "并从 profile 加载清单里摘除。此操作不可撤销，建议先「导出」备份。"
+            } else {
+                "将删除 ${cfg.rel}。此操作不可撤销，建议先「导出」备份。"
+            },
+            onDismiss = { pendingConfig = null },
+            onConfirm = {
+                val target = cfg
+                pendingConfig = null
+                deleting = true
+                Thread {
+                    val ok = deleteMcp(context, target)
+                    main.post {
+                        deleting = false
+                        if (ok) {
+                            DSHRunner.onLog("✅ 已删除 MCP 配置 ${target.rel}")
+                        } else {
+                            DSHRunner.onLog("❌ 删除 MCP 配置失败: ${target.rel}")
+                        }
+                        onRefresh()
+                    }
+                }.start()
+            }
+        )
+    }
+}
+
+/**
+ * 从一个经典 JSON / JSONC 配置里删掉单个服务条目。
+ *
+ * ## 为什么写回前要备份、写回会丢注释
+ *
+ * `org.json` 只能输出标准 JSON，注释在规范化过程中必然消失。
+ * 配置里若有用户手写的说明，这里保不住 —— 所以先存一份
+ * `<文件名>.bak-delete`，同时在确认框里如实告知。
+ *
+ * @return 是否真的改动并写回
+ */
+private fun removeServerFromConfig(cfg: McpConfig, serverName: String): Boolean {
+    val raw = runCatching { cfg.file.readText() }.getOrNull() ?: return false
+    val text = stripJsonc(raw.removePrefix("\uFEFF"))
+
+    // 备份：改坏了用户还能自己还原
+    runCatching {
+        File(cfg.file.parentFile, cfg.file.name + ".bak-delete").writeText(raw)
+    }
+
+    var touched = false
+
+    // 形状一：顶层对象
+    val obj = runCatching { org.json.JSONObject(text) }.getOrNull()
+    if (obj != null) {
+        // mcpServers 是对象
+        obj.optJSONObject("mcpServers")?.let { m ->
+            if (m.remove(serverName) != null) touched = true
+        }
+        // servers 是对象
+        obj.optJSONObject("servers")?.let { m ->
+            if (m.remove(serverName) != null) touched = true
+        }
+        // servers 是数组
+        obj.optJSONArray("servers")?.let { arr ->
+            val kept = org.json.JSONArray()
+            var arrTouched = false
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i)
+                if (o == null) {
+                    kept.put(arr.opt(i))
+                    continue
+                }
+                val n = o.optString("name").ifBlank { o.optString("id") }
+                if (n == serverName) {
+                    arrTouched = true
+                    continue
+                }
+                kept.put(o)
+            }
+            if (arrTouched) {
+                obj.put("servers", kept)
+                touched = true
+            }
+        }
+        if (touched) {
+            return runCatching {
+                cfg.file.writeText(obj.toString(2) + "\n")
+                true
+            }.getOrDefault(false)
         }
     }
 
-    Spacer(modifier = Modifier.height(8.dp))
-    FclSettingSection("操作")
-    FclSettingRow(
-        label = "刷新列表",
-        description = "重新读取 MCP 配置。",
-        shape = RowShape.SINGLE,
-        onClick = onRefresh
-    ) {
-        Text(text = "刷新", color = Fcl.ThemeText, fontSize = 12.sp)
+    // 形状二：顶层数组
+    val arr = runCatching { org.json.JSONArray(text) }.getOrNull() ?: return false
+    val kept = org.json.JSONArray()
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i)
+        if (o == null) {
+            kept.put(arr.opt(i))
+            continue
+        }
+        val n = o.optString("name").ifBlank { o.optString("id") }
+        if (n == serverName) {
+            touched = true
+            continue
+        }
+        kept.put(o)
     }
+    if (!touched) return false
+    return runCatching {
+        cfg.file.writeText(kept.toString(2) + "\n")
+        true
+    }.getOrDefault(false)
 }
+
+/**
+ * 删除一整份 MCP 配置。
+ *
+ * ## 两种形态，两套做法
+ *
+ * · **bundle**（`local-plugins/<包>/cordis.patch.yml`）：配置和它的
+ *   `mcp-server.mjs` / `launch-mcp.sh` 是一体的，只删 yml 会留下一个
+ *   没人引用的目录，所以**整个包目录一起删**，并从 profile 清单里摘除。
+ * · **经典配置**（`mcp.json`）：删掉整个文件即可。
+ *
+ * 软链只删链接本身 —— 对链接 `deleteRecursively()` 会顺着删掉外部目录，
+ * 不可恢复（与插件删除同一条铁律）。
+ */
+private fun deleteMcp(context: Context, cfg: McpConfig): Boolean = runCatching {
+    if (cfg.bundle) {
+        val pkgDir = cfg.file.parentFile ?: return@runCatching false
+        val pkgName = pkgDir.name
+        val removed = if (com.isLink(pkgDir)) {
+            pkgDir.delete()
+        } else {
+            pkgDir.deleteRecursively()
+        }
+        // 若它被登记进 profile 清单，一并摘掉；没登记就什么都不做
+        PluginSessionTransfer.unregisterPlugins(context, listOf(pkgName))
+        removed
+    } else {
+        cfg.file.delete()
+    }
+}.getOrDefault(false)
 
 // ----------------------------------------------------------------------
 // 读盘 / 格式化小工具
@@ -1008,41 +2377,352 @@ private fun EmptyState(title: String, detail: String) {
     FclSettingRow(label = title, description = detail, shape = RowShape.SINGLE)
 }
 
-private data class McpConfig(
+internal data class McpServer(
+    val name: String,
+    /** 给人看的一行细节：`command` / `url` 之类，取不到为空串。 */
+    val detail: String
+)
+
+internal data class McpConfig(
     val file: File,
-    val servers: List<String>,
+    /** 相对 `DSH_HOME` 的路径，界面上显示这个比绝对路径短得多。 */
+    val rel: String,
+    val servers: List<McpServer>,
     /** 非 null 表示文件读到了但解析不了，值是给人看的原因。 */
-    val parseError: String?
+    val parseError: String?,
+    /** 是不是 bundle 形式（`local-plugins` 下的 cordis.patch.yml）。 */
+    val bundle: Boolean = false
 )
 
 /**
- * 在数据目录里找 MCP 配置。
+ * MCP 扫描结果。
  *
- * 候选名按常见写法从近到远试；找不到返回 null。
+ * `internal` 而非 `private`：「MCP 下载」页也要列已装配置，
+ * 与设置页共用同一个扫描函数。
  */
-private fun lookupMcpConfig(root: File): McpConfig? {
-    val candidates = listOf(
-        "mcp.json",
-        "mcp.jsonc",
-        "config/mcp.json",
-        "mcp/servers.json"
-    )
-    for (rel in candidates) {
-        val f = File(root, rel)
-        if (!f.isFile) continue
-        val text = runCatching { f.readText() }.getOrNull()
-            ?: return McpConfig(f, emptyList(), "文件存在但读取失败")
-        return try {
-            val json = org.json.JSONObject(text)
-            val servers = json.optJSONObject("mcpServers")
-                ?: json.optJSONObject("servers")
-            val names = servers?.keys()?.asSequence()?.toList() ?: emptyList()
-            McpConfig(f, names, null)
-        } catch (e: org.json.JSONException) {
-            McpConfig(f, emptyList(), "不是标准 JSON（可能带注释），只报告文件存在")
+internal data class McpScan(
+    val configs: List<McpConfig>,
+    val searched: List<String>
+)
+
+/**
+ * 剥掉 JSONC 的注释与尾随逗号，让 `org.json` 能解析。
+ *
+ * ## 为什么不能直接用正则删 `//`
+ *
+ * 因为 `"url": "https://..."` 里的 `//` 会被误删，把值改坏。
+ * 所以走一个小状态机：只有**字符串之外**的 `//` 与斜杠加星号才算注释。
+ * 顺带处理尾随逗号（`{"a":1,}` 这种），那是 JSONC 允许但 JSON 不允许的。
+ *
+ * 这个函数不追求完备（不处理正则字面量之类，JSON 里也没有），
+ * 目标是让带注释的 MCP 配置能被读懂。
+ */
+private fun stripJsonc(text: String): String {
+    val sb = StringBuilder(text.length)
+    var i = 0
+    var inString = false
+    var escaped = false
+    while (i < text.length) {
+        val c = text[i]
+        if (inString) {
+            sb.append(c)
+            when {
+                escaped -> escaped = false
+                c == '\\' -> escaped = true
+                c == '"' -> inString = false
+            }
+            i++
+            continue
+        }
+        when {
+            c == '"' -> {
+                inString = true
+                sb.append(c)
+                i++
+            }
+            // 行注释：吃到行尾，但保留换行（否则两个 token 会粘在一起）
+            c == '/' && i + 1 < text.length && text[i + 1] == '/' -> {
+                while (i < text.length && text[i] != '\n') i++
+            }
+            // 块注释：吃到闭合
+            c == '/' && i + 1 < text.length && text[i + 1] == '*' -> {
+                i += 2
+                while (i + 1 < text.length &&
+                    !(text[i] == '*' && text[i + 1] == '/')
+                ) {
+                    i++
+                }
+                i = (i + 2).coerceAtMost(text.length)
+            }
+            else -> {
+                sb.append(c)
+                i++
+            }
         }
     }
+    // 尾随逗号：`,}` 与 `,]` 收敛掉（此时字符串已被精确保留，
+    // 所以这个正则不会碰到字符串内容里的逗号 —— 见下方注意事项）
+    return sb.toString().replace(Regex(",(\\s*[}\\]])"), "$1")
+}
+
+/**
+ * 解析一个 MCP 配置文件。
+ *
+ * 按四种已知形状依次尝试；都不匹配时返回 `parseError`，
+ * 而不是把「解析不了」伪装成「没有服务」。
+ */
+private fun parseMcpFile(f: File, rel: String): McpConfig {
+    val raw = runCatching { f.readText() }.getOrNull()
+        ?: return McpConfig(f, rel, emptyList(), "文件存在但读取失败")
+    if (raw.isBlank()) {
+        return McpConfig(f, rel, emptyList(), "文件是空的")
+    }
+
+    val text = stripJsonc(raw.removePrefix("\uFEFF"))
+
+    // 形状一：顶层是对象
+    runCatching {
+        val o = org.json.JSONObject(text)
+        // ① mcpServers 是对象
+        o.optJSONObject("mcpServers")?.let { return McpConfig(f, rel, namesOf(it), null) }
+        // ② servers 是对象
+        o.optJSONObject("servers")?.let { return McpConfig(f, rel, namesOf(it), null) }
+        // ③ servers 是数组
+        o.optJSONArray("servers")?.let { return McpConfig(f, rel, namesOfArray(it), null) }
+        // 对象解析成功但没有这三个键 —— 如实说明，不硬猜
+        return McpConfig(
+            f, rel, emptyList(),
+            "是合法 JSON，但没有 mcpServers / servers 字段"
+        )
+    }
+
+    // 形状四：顶层是数组
+    runCatching {
+        val arr = org.json.JSONArray(text)
+        return McpConfig(f, rel, namesOfArray(arr), null)
+    }
+
+    return McpConfig(
+        f, rel, emptyList(),
+        "不是可识别的 JSON / JSONC，只报告文件存在"
+    )
+}
+
+/** 从 `{ "name": { ... } }` 里取键名，并尽量带上一行细节。 */
+private fun namesOf(o: org.json.JSONObject): List<McpServer> {
+    val out = ArrayList<McpServer>(o.length())
+    val keys = o.keys()
+    while (keys.hasNext()) {
+        val k = keys.next()
+        val v = o.optJSONObject(k)
+        val detail = when {
+            v == null -> ""
+            v.optString("command").isNotBlank() -> "命令: " + v.optString("command")
+            v.optString("url").isNotBlank() -> "地址: " + v.optString("url")
+            else -> ""
+        }
+        out.add(McpServer(k, detail))
+    }
+    return out.sortedBy { it.name.lowercase(Locale.ROOT) }
+}
+
+/** 从 `[ { "name": ... } ]` 里取名字。 */
+private fun namesOfArray(arr: org.json.JSONArray): List<McpServer> {
+    val out = ArrayList<McpServer>(arr.length())
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        val name = o.optString("name").ifBlank { o.optString("id") }
+        if (name.isBlank()) continue
+        val detail = when {
+            o.optString("command").isNotBlank() -> "命令: " + o.optString("command")
+            o.optString("url").isNotBlank() -> "地址: " + o.optString("url")
+            else -> ""
+        }
+        out.add(McpServer(name, detail))
+    }
+    return out
+}
+
+/**
+ * 扫描 MCP 配置。
+ *
+ * 三条来源，全部扫一遍：
+ *  1. `DSH_HOME` 下的固定候选名；
+ *  2. 各 profile 目录下的 `mcp.json` / `mcp.jsonc`；
+ *  3. **有界搜索**：数据目录下两层以内、文件名以 `mcp` 开头的 json/jsonc。
+ *
+ * 第 3 条是兜底。跳过 `node_modules` / `sessions` / `storages` / `logs`
+ * 这几个大目录 —— 它们只会有成千上万的无关文件，扫进去只会拖慢界面。
+ */
+internal fun scanMcpConfigs(root: File): McpScan {
+    val searched = ArrayList<String>(12)
+    val seen = HashSet<String>(8)
+    val out = ArrayList<McpConfig>(4)
+
+    fun tryFile(f: File, rel: String) {
+        searched.add(f.absolutePath)
+        if (!f.isFile) return
+        val key = runCatching { f.canonicalPath }.getOrDefault(f.absolutePath)
+        if (!seen.add(key)) return
+        out.add(parseMcpFile(f, rel))
+    }
+
+    // ① 固定候选名
+    for (rel in listOf("mcp.json", "mcp.jsonc", "config/mcp.json", "mcp/servers.json")) {
+        tryFile(File(root, rel), rel)
+    }
+
+    // ② profile 目录下
+    val profiles = File(root, "profiles")
+    if (profiles.isDirectory) {
+        val kids = runCatching { profiles.listFiles() }.getOrNull().orEmpty()
+        for (p in kids) {
+            if (!p.isDirectory || p.name.startsWith(".")) continue
+            for (name in listOf("mcp.json", "mcp.jsonc")) {
+                tryFile(File(p, name), "profiles/${p.name}/$name")
+            }
+        }
+    }
+
+    // ③ local-plugins 里的 **bundle 形式** MCP 包
+    //
+    // ★ 这是「MCP 装好了但列表里什么都没有」的真正原因 ★
+    //
+    // bundle 形式的 MCP 不是 `mcp.json`，而是：
+    //
+    // ```
+    // profiles/web/local-plugins/dsh-shell-demo/
+    //   cordis.patch.yml   ← 插入 @deepseek-ai/dsh-mcp-client，带 serverName
+    //   mcp-server.mjs     ← 真正的 stdio server
+    //   launch-mcp.sh
+    // ```
+    //
+    // 上面两步只找「文件名以 mcp 开头、扩展名 json/jsonc」的文件，
+    // 而这里的配置叫 `cordis.patch.yml`（YAML，且不以 mcp 开头），
+    // 于是被完全跳过 —— 服务明明在跑，页面却显示「还没有 MCP 配置」。
+    val localPlugins = ArrayList<File>(4)
+    for (p in runCatching { profiles.listFiles() }.getOrNull().orEmpty()) {
+        if (!p.isDirectory || p.name.startsWith(".")) continue
+        val lp = File(p, "local-plugins")
+        if (!lp.isDirectory) continue
+        for (pkg in runCatching { lp.listFiles() }.getOrNull().orEmpty()) {
+            if (pkg.isDirectory && !pkg.name.startsWith(".")) localPlugins.add(pkg)
+        }
+    }
+    for (pkg in localPlugins) {
+        val cfg = parseMcpBundle(pkg, root)
+        if (cfg != null) {
+            searched.add(cfg.file.absolutePath)
+            val key = runCatching { cfg.file.canonicalPath }.getOrDefault(cfg.file.absolutePath)
+            if (seen.add(key)) out.add(cfg)
+        }
+    }
+
+    // ④ 有界搜索兜底
+    val skip = setOf("node_modules", "sessions", "storages", "logs", ".git")
+    fun walk(dir: File, depth: Int, rel: String) {
+        if (depth > 2) return
+        val kids = runCatching { dir.listFiles() }.getOrNull() ?: return
+        for (f in kids) {
+            if (com.isLink(f)) continue
+            val childRel = if (rel.isEmpty()) f.name else "$rel/${f.name}"
+            if (f.isDirectory) {
+                if (f.name in skip) continue
+                if (f.name.startsWith(".")) continue
+                walk(f, depth + 1, childRel)
+                continue
+            }
+            val n = f.name.lowercase(Locale.ROOT)
+            if (!n.startsWith("mcp")) continue
+            if (!n.endsWith(".json") && !n.endsWith(".jsonc")) continue
+            tryFile(f, childRel)
+        }
+    }
+    if (root.isDirectory) walk(root, 0, "")
+
+    // 有服务的那几份排前面，空/坏配置排后面 —— 用户打开这页是想看有什么服务
+    val sorted = out.sortedWith(
+        compareByDescending<McpConfig> { it.servers.size }
+            .thenBy { it.rel }
+    )
+    return McpScan(sorted, searched)
+}
+
+/**
+ * 判断 `local-plugins` 下的一个包是不是 **MCP bundle**，并读出它的服务名。
+ *
+ * ## bundle 形式长什么样
+ *
+ * `local-plugins` 里的 MCP 不走 `mcp.json`，而是在 `cordis.patch.yml` 里
+ * 插入 `@deepseek-ai/dsh-mcp-client`，并用 `serverName` 声明服务名：
+ *
+ * ```
+ * # profiles/web/local-plugins/dsh-shell-demo/cordis.patch.yml
+ * - target: '@deepseek-ai/dsh-mcp-client'
+ *   serverName: shell
+ *   command: /path/to/launch-mcp.sh
+ * ```
+ *
+ * 所以判据是「文件里出现 dsh-mcp-client」，服务名用正则从 `serverName`
+ * 抠出来 —— 这里**不做完整 YAML 解析**：为此引一个 YAML 库不值得，
+ * 而且 `cordis.patch.yml` 是用户手写的，格式容错比严格更重要。
+ *
+ * @param pkg  `local-plugins` 下的包目录
+ * @param root `$DSH_HOME`，用来算相对路径
+ * @return 是 MCP bundle 时返回配置；不是（或读不了）返回 null
+ */
+private fun parseMcpBundle(pkg: File, root: File): McpConfig? {
+    for (name in listOf("cordis.patch.yml", "cordis.patch.yaml", "cordis.yml")) {
+        val f = File(pkg, name)
+        if (!f.isFile) continue
+        val text = runCatching { f.readText() }.getOrNull() ?: continue
+        // 判据：这条配置有没有挂 MCP 客户端插件
+        if (!text.contains("dsh-mcp-client")) continue
+
+        // serverName: shell  /  serverName: "shell"  /  serverName: 'shell'
+        val serverName = Regex("serverName\\s*:\\s*[\"']?([A-Za-z0-9_.-]+)")
+            .find(text)?.groupValues?.get(1)
+
+        val rel = bundleRel(pkg, root, name)
+
+        return McpConfig(
+            file = f,
+            rel = rel,
+            servers = if (serverName != null) {
+                listOf(McpServer(serverName, "bundle: ${pkg.name}"))
+            } else {
+                emptyList()
+            },
+            // 找到 bundle 但没读到 serverName：如实说明，不硬编一个名字
+            parseError = if (serverName == null) {
+                "是 MCP bundle，但没读到 serverName 字段"
+            } else {
+                null
+            },
+            bundle = true
+        )
+    }
     return null
+}
+
+/**
+ * 算出 bundle 配置相对 `$DSH_HOME` 的路径。
+ *
+ * 优先用 canonicalPath 真算；算不出来（路径不在 root 下、规范化失败）
+ * 才退回按 `profiles/web/local-plugins/<包>/<文件>` 拼 ——
+ * 后者是 dsh 的标准位置，极端情况下也不至于给出一个乱路径。
+ */
+private fun bundleRel(pkg: File, root: File, fileName: String): String {
+    val real = runCatching {
+        val base = root.canonicalPath
+        val p = pkg.canonicalPath
+        if (p.startsWith(base + File.separator)) {
+            p.substring(base.length + 1) + "/" + fileName
+        } else {
+            null
+        }
+    }.getOrNull()
+    return real ?: "profiles/web/local-plugins/${pkg.name}/$fileName"
 }
 
 // `describe(f)` 已删除：重写插件页后不再需要「目录 · N 项」这种描述

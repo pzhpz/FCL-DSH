@@ -2,10 +2,12 @@ package com
 
 import android.content.Context
 import android.os.Build
+import com.example.fcldsh.AccountStore
 import com.example.fcldsh.AgentGuide
 import com.example.fcldsh.Instances
 import com.example.fcldsh.LauncherPrefs
 import com.example.fcldsh.PermissionMode
+import com.example.fcldsh.RequireBuiltinShim
 import com.example.fcldsh.SandboxBackend
 import java.io.File
 import java.io.FileOutputStream
@@ -2624,6 +2626,27 @@ object DSHRunner {
             // 用锁文件实现同等语义，绕开原生模块。
             ensureFlockShim(context)
 
+            // ── 原生绑定替身（与 flock 同一思路的第二个实例）───────────────
+            //
+            // 上游 node-addon-require-builtin 从未发布 android 变体，
+            // 而 0.2.1-rc.5 / 0.2.2-alpha.2 会在 boot 阶段强制要求它。
+            // 加载器只校验导出形状、不校验是否为二进制，所以用纯 JS 顶上，
+            // 能力来自启动参数里已有的 --expose-internals。
+            //
+            // 这里再装配一次（预检里已经装过）：走「允许启动不受支持的引擎」
+            // 那条路时预检会被跳过，必须在启动前兜住。
+            runCatching {
+                RequireBuiltinShim.ensure(context, onLog)
+            }.onFailure { onLog("⚠️ 原生绑定替身装配失败: ${it.message}") }
+
+            // 原生绑定预检**不在这里**做。
+            //
+            // 它被移到了 MainActivity.startInstance：判定「这个版本跑不起来」
+            // 时要能直接中止启动并把状态置成 ERROR，而 startNode 是 void，
+            // 在这里 return 只会让界面永远停在「启动中」。
+            //
+            // 详见 NativeBindingGuard 的类注释。
+
             onLog("正在启动 Node 进程...")
 
             // dsh 的"默认工作区"由 Host controller 按 Documents 路径策略推导。
@@ -2841,6 +2864,39 @@ object DSHRunner {
             // bash/glob/grep 会被 dsh 拒绝执行；需要这些能力时用户须显式开启
             // 「完全访问」并接受相应风险。
             env["DSH_PERMISSION_MODE"] = permissionMode.id
+
+            // ── 用户密钥注入（每次启动都注入，与 dsh 已有账号共存）──────────
+            //
+            // 把启动器里**当前选中**的账号写进环境变量（OPENAI_API_KEY 这类
+            // 各家通用的变量名），同时落一份 $DSH_HOME/android-account.json
+            // 给需要完整信息的插件读。
+            //
+            // ★ 与 dsh 已有配置共存 ★
+            //
+            // 把 env 现有内容传进去：**已经有值的键会被跳过**，绝不覆盖。
+            // dsh 自己的账号（或其 env 文件里配好的密钥）优先级更高，
+            // 启动器只在缺位时补上。上一版曾无条件覆盖 DEEPSEEK_BASE_URL，
+            // 直接把用户原本能用的账号打成 404 —— 这类覆盖一律不再做。
+            //
+            // 没有选中账号时什么都不做：不塞空字符串，那会让 dsh 以为
+            // 「配置了但值是空的」。
+            runCatching {
+                AccountStore.ensureLoaded(context)
+                // applyToEnvironment 返回一份待**新增**的变量表，由这里写进 env。
+                //
+                // ★ 为什么不把 env 传进去让函数自己写 ★
+                //
+                // `pb.environment()` 在 Kotlin 里推断成只读的
+                // `Map<String, String>`，当 `MutableMap` 形参传会报
+                // 「Type mismatch」。让它返回 Map、这里 forEach 写入，
+                // 两侧都不需要强转，也不用 @Suppress。
+                val toAdd = AccountStore.applyToEnvironment(context, env)
+                toAdd.forEach { (k, v) -> env[k] = v }
+                if (toAdd.isEmpty()) {
+                    onLog("ℹ️ 未注入密钥（没有选中账号，或 dsh 已自行配置）")
+                }
+                AccountStore.describeForLog()?.let { onLog("账号: $it") }
+            }.onFailure { onLog("⚠️ 账号注入失败: ${it.message}") }
 
             onLog("cwd: ${workDir.absolutePath}")
             onLog("Documents: ${documentsDir.absolutePath}")

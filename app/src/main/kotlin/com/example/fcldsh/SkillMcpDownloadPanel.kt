@@ -360,7 +360,7 @@ fun McpDownloadPanel(onImport: () -> Unit) {
 // ----------------------------------------------------------------------
 
 /** 用系统浏览器打开一个链接；没有可用浏览器时静默失败（不崩）。 */
-private fun openUrl(context: Context, url: String) {
+internal fun openUrl(context: Context, url: String) {
     val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     runCatching { context.startActivity(intent) }

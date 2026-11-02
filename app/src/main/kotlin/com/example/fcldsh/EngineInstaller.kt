@@ -590,9 +590,12 @@ object EngineInstaller {
                 // 与 npm 分支同理：要的是「只装 android 平台的可选依赖」，
                 // 不是「一个可选依赖都不装」。
                 //
-                // `--config.optional=false` 会把 node-addon-require-builtin-android-arm64
-                // 这类**上游专门为 Android 发布**的原生绑定一起排除，
-                // dsh 0.2.2+ 启动时就会因为找不到原生绑定直接崩溃。
+                // ⚠️ 注意（已查证）：`node-addon-require-builtin` 上游
+                // **从未发布过 android 变体** —— 它的 optionalDependencies
+                // 只有 darwin / linux / win32，`...-android-arm64` 在 npm 上
+                // 是 404。所以这些参数能让 @vscode/ripgrep 之类的包装上
+                // 正确的 android 变体，但**救不了** dsh 0.2.2+ 的那个依赖。
+                // 详见 NativeBindingGuard 的注释。
                 "--config.supportedArchitectures.os=android",
                 "--config.supportedArchitectures.cpu=${npmCpuForDevice()}",
                 "--reporter=append-only"
@@ -613,18 +616,31 @@ object EngineInstaller {
                 // | 包 | 能否在 Android 上跑 | 该不该装 |
                 // |---|---|---|
                 // | `@img/sharp-linux-x64`、`@vscode/ripgrep-linux-arm64` | ❌ glibc 构建，bionic 缺 `__errno_location` | 不装 |
-                // | `node-addon-require-builtin-**android-arm64**` | ✅ 上游专门为 Android 发布 | **必须装** |
-                //
-                // `--omit=optional` 把两类一起砍了，于是 dsh 0.2.2+ 启动即崩：
-                //
-                // ```
-                // host preparation failed:
-                //   No usable native binding found for node-addon-require-builtin-android-arm64
-                // ```
+                // | `@vscode/ripgrep-android-arm64` 这类真 android 变体 | ✅ | **必须装** |
                 //
                 // 换成显式的 `--os/--cpu` 后，npm 会按 package.json 的
                 // `os`/`cpu` 字段筛选：android 变体装上，linux 变体自动排除。
-                // 既拿到了需要的原生绑定，又不会引入跑不了的 linux 二进制。
+                //
+                // ## ⚠️ 这套参数救不了 0.2.2-alpha.x 的那个依赖（已查证）
+                //
+                // 曾经以为 `node-addon-require-builtin-android-arm64` 是
+                // 「上游专门为 Android 发布、只是被 --omit=optional 漏掉了」。
+                // **这个判断是错的**，实测：
+                //
+                // · `node-addon-require-builtin@0.1.9` 的 optionalDependencies
+                //   只有 darwin-x64/arm64、linux-x64/arm64（gnu+musl）、win32-*
+                // · `node-addon-require-builtin-android-arm64` → HTTP 404
+                //
+                // 也就是说上游从未发布过 android 变体。装多少次、换什么参数，
+                // 都不可能拿到这个绑定 —— 这是上游适配缺口，不是安装参数问题。
+                //
+                // ⚠️ 注意别把结论说成「只有 alpha 才有这个依赖」：
+                // dsh-app-boot 的 **0.2.1-rc.4 与 0.2.2-alpha.2 都依赖
+                // node-addon-require-builtin@^0.1.9**（查 registry 确认）。
+                // rc.4 能在 Android 上跑，是因为它没在 boot 阶段强制要求
+                // 这个绑定；0.2.2-alpha.2 会无条件要求，所以直接崩。
+                // 版本行为差异，不是依赖的有无。
+                // 启动时由 NativeBindingGuard 提前给出这个结论。
                 //
                 // ⚠️ 必须显式传 `--os=android`，不能依赖 npm 自动探测：
                 // 容器里有个 spawn 补丁把 `process.platform` 伪装成 `linux`

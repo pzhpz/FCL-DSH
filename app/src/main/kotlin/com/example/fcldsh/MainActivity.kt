@@ -1721,6 +1721,9 @@ class MainActivity : ComponentActivity() {
 
                 LauncherPanel.LOG -> LogPanel(state = state)
 
+                // 用户（密钥）管理：由主页右上角的头像区点开
+                LauncherPanel.ACCOUNT -> AccountPanel()
+
                 LauncherPanel.NONE -> Unit
             }
         }
@@ -2071,6 +2074,12 @@ class MainActivity : ComponentActivity() {
         val context = LocalContext.current
         var mode by remember { mutableStateOf(LauncherPrefs.getPermissionMode(context)) }
         var pendingDanger by remember { mutableStateOf<PermissionMode?>(null) }
+
+        // 是否允许启动「预检判定为不可运行」的引擎（默认关）。
+        // 见 LauncherPrefs.getForceUnsupportedEngine 的注释。
+        var forceUnsupported by remember {
+            mutableStateOf(LauncherPrefs.getForceUnsupportedEngine(context))
+        }
         // 选项卡：0 启动器设置 / 1 权限设置 / 2 关于
         var tab by remember { mutableStateOf(0) }
 
@@ -2292,6 +2301,35 @@ class MainActivity : ComponentActivity() {
                             fontSize = 11.sp,
                             lineHeight = 16.sp
                         )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // ── 引擎兼容 ────────────────────────────────────────
+                        //
+                        // 默认关。启动前会预检原生绑定，判定不可运行时直接中止
+                        // 启动（不再把上百行堆栈倒给用户）。这个开关是那条判定
+                        // 的唯一逃生口 —— 判定终归是静态推断，万一误判，用户
+                        // 仍能强行尝试。
+                        FclSettingSection("引擎兼容")
+                        FclSettingRow(
+                            label = "允许启动不受支持的引擎",
+                            description = "开启后跳过原生绑定预检，强行启动。" +
+                                "若引擎确实缺少上游未发布的 android 原生绑定，" +
+                                "启动仍会失败并输出完整堆栈。",
+                            shape = RowShape.SINGLE,
+                            onClick = {
+                                forceUnsupported = !forceUnsupported
+                                LauncherPrefs.setForceUnsupportedEngine(
+                                    context, forceUnsupported
+                                )
+                            }
+                        ) {
+                            Text(
+                                text = if (forceUnsupported) "已开启" else "已关闭",
+                                color = if (forceUnsupported) Fcl.Danger else Fcl.TextTertiary,
+                                fontSize = 11.sp
+                            )
+                        }
 
                         Spacer(modifier = Modifier.height(8.dp))
 
@@ -2548,11 +2586,13 @@ class MainActivity : ComponentActivity() {
                         FclSettingSection("开发者")
                         FclSettingRow(
                             label = "夜ksy",
-                            description = "问题反馈、功能建议、安装遇到卡点，都可以通过下面任一渠道找。",
+                            description = "提出需求、在真机上测试并反馈问题。" +
+                                "问题反馈、功能建议、安装遇到卡点，都可以通过下面任一渠道找。",
                             shape = RowShape.TOP
                         ) {
+                            // 不写「开发」：代码不是他逐行写的，见下面「开发方式」。
                             Text(
-                                text = "开发",
+                                text = "需求与验收",
                                 color = Fcl.Success,
                                 fontSize = 10.sp
                             )
@@ -2610,7 +2650,36 @@ class MainActivity : ComponentActivity() {
                         )
                         FclSettingRow(
                             label = "界面",
-                            description = "Kotlin + Jetpack Compose 手写。",
+                            description = "Kotlin + Jetpack Compose。代码由 AI 生成，" +
+                                "不是逐行手写的 —— 详见下面「开发方式」。",
+                            shape = RowShape.BOTTOM
+                        )
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        FclSettingSection("开发方式")
+                        FclSettingRow(
+                            label = "代码非手工编写",
+                            description = "本应用的 Kotlin 代码由 AI 助手生成与修改。" +
+                                "没有复制现成工程，也不是逐行手敲的。",
+                            shape = RowShape.TOP
+                        )
+                        FclSettingRow(
+                            label = "在手机上完成",
+                            description = "全部开发在 Android 手机上的 CodeAssist（设备内 IDE）里进行，" +
+                                "没有使用电脑、Android Studio，也没有跑桌面版 Gradle。",
+                            shape = RowShape.MIDDLE
+                        )
+                        FclSettingRow(
+                            label = "分工",
+                            description = "夜ksy 提出需求、在真机上安装测试、反馈日志；" +
+                                "AI 负责定位原因、写代码、验证编译。",
+                            shape = RowShape.MIDDLE
+                        )
+                        FclSettingRow(
+                            label = "为什么说清楚",
+                            description = "「手写」是不实描述。这个项目能跑起来，" +
+                                "靠的是需求、实测和 AI 生成三者配合，" +
+                                "如实标注比含糊其辞更有用。",
                             shape = RowShape.BOTTOM
                         )
 
@@ -2821,12 +2890,20 @@ class MainActivity : ComponentActivity() {
                     DownloadTabBar(selected = tab, onSelect = { tab = it })
                 }
 
-                if (tab == DownloadTab.DSH) {
+                // 标签内容走竖向滑动（见 FclTabContentHost）：初次展开从下方伸入；
+                // 切换标签时旧的向下滑走、新的向上滑入，两条同时进行。
+                //
+                // weight 交给 host —— 它内部是 Box，分支里不能再 weight，
+                // 所以各分支的修饰符相应从 weight(1f) 改成 fillMaxSize()。
+                FclTabContentHost(
+                    tab = tab,
+                    modifier = Modifier.fillMaxWidth().weight(1f)
+                ) { activeTab ->
+                if (activeTab == DownloadTab.DSH) {
                     // dsh 下载：沿用原有的引擎安装面板（唯一接了真实数据的一页）
                     Column(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
+                            .fillMaxSize()
                             .verticalScroll(rememberScrollState())
                             // 20dp 收到 12dp：与插件下载页保持同一套外距，
                             // 两个页签切换时内容左边不会跳位置
@@ -2997,7 +3074,7 @@ class MainActivity : ComponentActivity() {
                         lineHeight = 15.sp
                     )
                     }
-                } else if (tab == DownloadTab.PLUGIN) {
+                } else if (activeTab == DownloadTab.PLUGIN) {
                     // 插件下载：接了真实数据（插件市场索引 → 装进当前实例）。
                     //
                     // ★ 这里必须给成有界高度，不能套 verticalScroll ★
@@ -3007,21 +3084,17 @@ class MainActivity : ComponentActivity() {
                     // verticalScroll，高度约束会变成无限，两栏塌成内容高度、
                     // 分栏直接立不起来（实例设置页踩过同一个坑）。
                     Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
+                        modifier = Modifier.fillMaxSize()
                     ) {
                         PluginDownloadPanel()
                     }
-                } else if (tab == DownloadTab.SKILL) {
+                } else if (activeTab == DownloadTab.SKILL) {
                     // skill 下载：走「粘链接安装」，不复用插件那套翻页列表 ——
                     // skill 没有统一的版本索引可拉，硬套只会得到一个空列表。
                     //
                     // 同样必须给有界高度（两栏布局），不能套 verticalScroll。
                     Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
+                        modifier = Modifier.fillMaxSize()
                     ) {
                         SkillDownloadPanel(
                             onImport = {
@@ -3029,12 +3102,10 @@ class MainActivity : ComponentActivity() {
                             }
                         )
                     }
-                } else if (tab == DownloadTab.MCP) {
+                } else if (activeTab == DownloadTab.MCP) {
                     // MCP 下载：本质是「注册表入口 + 导入」，理由见该面板的注释。
                     Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
+                        modifier = Modifier.fillMaxSize()
                     ) {
                         McpDownloadPanel(
                             onImport = {
@@ -3046,9 +3117,10 @@ class MainActivity : ComponentActivity() {
                     // 整合包：版式照 FCL 的 page_download.xml。
                     // 右侧是空态（尚未接入下载源），假列表与假按钮已按需求去掉。
                     DownloadBrowseTab(
-                        tab = tab,
+                        tab = activeTab,
                         onPickLocalFile = onPickLocalFile
                     )
+                }
                 }
             }
         }
@@ -3427,32 +3499,66 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 账号区：头像 + 用户名，居中。
+     * 账号区：头像 + 用户名，居中；**整块可点**，点开用户管理面板。
      *
      * 排版照 FCL `activity_main.xml` 的 `@id/account`：
      * 52dp 圆头像 → 名字（16sp 粗体、主题色）→ 一行提示（12sp）。
-     * 这里没有「添加账户」提示，因为本启动器只有一个本机用户，
-     * 那行提示在 FCL 里是用来引导登入微软账户的，这里放会误导。
+     *
+     * ## 名字从哪来
+     *
+     * 显示的是 [AccountStore] 里**当前选中**的那个账号名。
+     * 没有账号时回落到「用户」——这是启动器自己的称呼，不是数据。
+     *
+     * 账号名只在这里（和用户列表里）出现，**不注入 dsh**：
+     * 它是给人看的标签，对引擎没有语义。
      */
     @Composable
     private fun AccountBlock() {
+        val context = LocalContext.current
+        // 首次进入时从磁盘加载账号（幂等，重复调用无副作用）
+        remember { AccountStore.ensureLoaded(context); 0 }
+
+        // 订阅这两个状态：选中变了、列表变了，这里都要跟着变
+        val selectedId = AccountStore.selectedId
+        val accounts = AccountStore.accounts
+        val current = remember(selectedId, accounts.size) {
+            accounts.firstOrNull { it.id == selectedId }
+        }
+
         Column(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                // 整块可点：带按下缩放反馈，和侧栏图标同一种手感
+                .clip(RoundedCornerShape(Fcl.Radius))
+                .fclClickable { ui.openPanel(LauncherPanel.ACCOUNT) }
+                .padding(vertical = 4.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             // 头像：DSH 图标。之前是「渐变底 + JS 字母」，
             // 渐变不符合扁平化要求，改用真实图标（纯色兜底）。
             DshLogo(size = 52.dp, corner = 14.dp)
             Spacer(modifier = Modifier.height(4.dp))
-            // 原来分两行显示「本地用户 / 离线账户」，现在合并为一行。
-            // 这个启动器只有单机场景，账户类型对用户没有实际意义。
             Text(
-                text = "用户",
+                text = current?.name ?: "用户",
                 // FCL 的 account_name 用 app:use_theme_color="true"，即主题蓝
                 color = Fcl.ThemeText,
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
-                maxLines = 1
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            // 一行提示，说明这里能点 —— 否则用户不会想到头像是入口。
+            // 有账号时顺带说明用的是哪种协议，没账号时直接引导去添加。
+            Text(
+                text = when {
+                    current == null -> "点此添加密钥"
+                    else -> "点此管理 · ${current.effectiveProtocol.label}"
+                },
+                color = Fcl.TextTertiary,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }
@@ -4146,6 +4252,37 @@ class MainActivity : ComponentActivity() {
                     hint("请先下载 dsh 引擎")
                 }
                 return@Thread
+            }
+
+            // 3) 原生绑定预检 —— 判定不可运行时**直接中止**，不再倒堆栈。
+            //
+            // dsh 0.2.2-alpha.x 依赖一个上游从未发布的 android 原生绑定，
+            // 起不来是确定的。以前这里只是打印原因然后照常启动，结果用户
+            // 看到的是「一屏解释 + 145 行堆栈」—— 结论都给了，堆栈纯属噪音。
+            //
+            // 放在这里而不是 DSHRunner.startNode 里：只有在这里才能把
+            // runState 置成 ERROR。startNode 是 void，在里面 return 会让
+            // 界面永远停在「启动中」。
+            if (!LauncherPrefs.getForceUnsupportedEngine(this)) {
+                // 预检自己的日志也要回主线程写，与其它日志保持同一条输出
+                val emit: (String) -> Unit = { msg -> runOnUiThread { ui.log(msg) } }
+                val ok = runCatching {
+                    NativeBindingGuard.preflight(this, emit)
+                }.getOrDefault(true)
+                if (!ok) {
+                    runOnUiThread {
+                        ui.runState = RunState.ERROR
+                        ui.log("⏹ 已中止启动（结论明确，不再输出 dsh 的堆栈）")
+                        ui.log("   换用 0.2.1-rc.4 等更早的版本即可正常启动")
+                        ui.log("   确实想强行试试：设置 → 启动器设置 → 允许启动不受支持的引擎")
+                        hint("这个引擎版本在本机无法运行")
+                    }
+                    return@Thread
+                }
+            } else {
+                runOnUiThread {
+                    ui.log("⚠️ 已允许启动不受支持的引擎，继续进行（失败属预期）")
+                }
             }
 
             DSHRunner.startNode(this)

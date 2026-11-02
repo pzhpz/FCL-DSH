@@ -135,6 +135,9 @@ object LauncherPrefs {
     private const val KEY_VERSION_ISOLATION = "version_isolation"
     private const val KEY_DATA_MIGRATED = "data_migrated"
     private const val KEY_PLUGIN_SOURCE = "plugin_source_url"
+    private const val KEY_FORCE_UNSUPPORTED = "force_unsupported_engine"
+    private const val KEY_EXIT_BTN_X = "web_exit_btn_x"
+    private const val KEY_EXIT_BTN_Y = "web_exit_btn_y"
 
     /**
      * dsh 引擎下载地址的默认值。
@@ -170,6 +173,56 @@ object LauncherPrefs {
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_ENGINE_URL, url.trim())
+            .apply()
+    }
+
+    /**
+     * 是否允许启动「预检判定为不可运行」的引擎版本。默认关。
+     *
+     * ## 为什么需要这个开关
+     *
+     * dsh 0.2.2-alpha.x 缺少上游从未发布的 android 原生绑定，本机必然起不来。
+     * 预检会直接中止启动，不再把上百行堆栈倒给用户 —— 但这建立在
+     * 「我们的判定是对的」这个前提上。
+     *
+     * 判定逻辑（看父包在不在、看 optionalDependencies 有没有 android 变体、
+     * 看 build 产物）终归是静态推断，可能因上游结构变化而误判。
+     * 留一个显式开关，用户仍能强行尝试；默认关，避免正常用户被误判挡住。
+     */
+    fun getForceUnsupportedEngine(context: Context): Boolean {
+        val sp = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        return sp.getBoolean(KEY_FORCE_UNSUPPORTED, false)
+    }
+
+    /** 写入「允许启动不受支持的引擎」。 */
+    fun setForceUnsupportedEngine(context: Context, on: Boolean) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_FORCE_UNSUPPORTED, on)
+            .apply()
+    }
+
+    /**
+     * 网页窗口里那个悬浮「✕」关闭键的位置，归一化成 0..1。
+     *
+     * 默认 `(1f, 0f)` = 右上角（与改动前的固定位置一致）。
+     *
+     * ## 为什么存比例而不是像素
+     *
+     * 像素值在换设备、转屏、分屏后可能落到屏幕外；比例只要乘上当前可用
+     * 宽高就一定在范围内。这也是拖动后能「记住位置」的实现基础。
+     */
+    fun getWebExitButtonPos(context: Context): Pair<Float, Float> {
+        val sp = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        return sp.getFloat(KEY_EXIT_BTN_X, 1f) to sp.getFloat(KEY_EXIT_BTN_Y, 0f)
+    }
+
+    /** 写入关闭键位置（会夹到 0..1，防止越界值把按钮放到屏幕外）。 */
+    fun setWebExitButtonPos(context: Context, x: Float, y: Float) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit()
+            .putFloat(KEY_EXIT_BTN_X, x.coerceIn(0f, 1f))
+            .putFloat(KEY_EXIT_BTN_Y, y.coerceIn(0f, 1f))
             .apply()
     }
 

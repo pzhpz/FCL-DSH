@@ -182,7 +182,10 @@ fun InstanceSettingsPanel(
                     .weight(1f)
                     .padding(horizontal = 20.dp, vertical = 4.dp)
             ) {
-                when (tab) {
+                // 标签内容走竖向滑动：初次展开从下方伸入；切换标签时
+                // 旧的向下滑走、新的向上滑入，两条同时进行。
+                // 面板整体缩回时这里不做任何事（横向缩回由 PanelHost 负责）。
+                FclTabContentHost(tab = tab) { activeTab -> when (activeTab) {
                     InstanceTab.DSH -> ScrollingTab {
                         DshSettingsTab(
                             state = state,
@@ -237,7 +240,7 @@ fun InstanceSettingsPanel(
                         onImport = onImportMcp,
                         onExportMcpConfig = onExportMcpConfig
                     )
-                }
+                } }
             }
         }
     }
@@ -925,7 +928,7 @@ private fun RowAction(
  * 这类操作频率低，每次都确认更稳妥。
  */
 @Composable
-private fun ConfirmDialog(
+internal fun ConfirmDialog(
     title: String,
     detail: String,
     confirmText: String = "删除",

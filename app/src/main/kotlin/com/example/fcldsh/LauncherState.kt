@@ -29,7 +29,8 @@ enum class LauncherPanel(val title: String) {
     INSTANCE("实例设置"),
     DOWNLOAD("下载中心"),
     SETTINGS("设置"),
-    LOG("运行日志")
+    LOG("运行日志"),
+    ACCOUNT("用户")
 }
 
 /**

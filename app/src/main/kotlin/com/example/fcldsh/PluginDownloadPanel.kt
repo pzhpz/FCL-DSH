@@ -105,10 +105,16 @@ fun PluginDownloadPanel() {
         }
     }
 
-    // 已装版本表。按 tick 与条目数缓存：装完后要立刻能看出哪几项已装。
-    val installed = remember(tick, PluginDownloader.entries.size) {
-        PluginDownloader.entries.associate { it.pkg to PluginDownloader.installedVersion(context, it.pkg) }
-    }
+    // ★ 不再为「全部条目」预造已装版本表 ★
+    //
+    // 早先是 `entries.associate { pkg to installedVersion(pkg) }` ——
+    // 市场里 97 个条目就是 97 次磁盘访问，而 `installedVersion()` 还要
+    // 读整个 package.json。这些全在主线程的组合阶段做，切换标签时
+    // （新旧两页同时渲染）会卡到肉眼可见。
+    //
+    // 现在改成**只算当前页可见的那 10 条**：由各行的 remember 惰性完成，
+    // 滚不到的行根本不碰磁盘。这是最省事也最有效的做法 ——
+    // 不用加协程、不用改数据层，只把「算多少」缩到需要的范围。
 
     // 外边距从 20dp 收到 12dp：面板本身已有 PanelHost 的底色与内缩，
     // 再套 20dp 会让两栏整体往中间挤、左右空出两条无用的边。
@@ -348,7 +354,11 @@ fun PluginDownloadPanel() {
                     filtered.isEmpty() -> Hint("没有匹配「$query」的插件。")
                     else -> {
                         shown.forEachIndexed { i, e ->
-                            val ver = installed[e.pkg]
+                            // 只对这一行算「装没装」：每页 10 条，代价可控。
+                            // 键里带 tick：装完一轮后 tick 变化，标记随即刷新。
+                            val ver = remember(e.pkg, tick) {
+                                PluginDownloader.installedVersion(context, e.pkg)
+                            }
                             if (i > 0) Spacer(modifier = Modifier.height(4.dp))
                             // ★ 每项用 SINGLE 而不是 of(i, size) ★
                             //
@@ -437,7 +447,9 @@ fun PluginDownloadPanel() {
         VersionPickerDialog(
             entry = entry,
             engineVersion = instance,
-            installedVersion = installed[entry.pkg],
+            installedVersion = remember(entry.pkg, tick) {
+                PluginDownloader.installedVersion(context, entry.pkg)
+            },
             onDismiss = { versionPicker = null },
             onPick = { info ->
                 versionPicker = null

@@ -8,7 +8,9 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.webkit.*
 import android.widget.EditText
@@ -19,6 +21,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.FileProvider
 import java.io.File
+import kotlin.math.abs
 
 /**
  * 网页运行窗口（仿 FCL 的独立全屏窗口）。
@@ -59,6 +62,15 @@ class DshWebActivity : ComponentActivity() {
          * 拒绝时给出明确日志，而不是让页面一直转圈。
          */
         private const val MAX_PICK_BYTES = 64L * 1024 * 1024
+
+        /**
+         * 关闭键静置时的透明度。
+         *
+         * 0.35 是「看得见入口、但又几乎不干扰阅读」的折中：
+         * 再低会让人找不到怎么退出，再高就回到原来遮挡观感的问题。
+         * 按下时立刻变到 1.0，明确反馈「抓到了」。
+         */
+        private const val EXIT_IDLE_ALPHA = 0.35f
     }
 
     private lateinit var webView: WebView
@@ -200,17 +212,30 @@ class DshWebActivity : ComponentActivity() {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
+
+        // 关闭键：可拖动、静置半透明，避开 dsh 页面右上角的控件。
+        // 用 TOP|START + 左右边距自由定位 —— END 对齐下改 leftMargin 不会移动，
+        // 那样就没法拖了。
+        val exitBtn = makeExitButton(root)
         root.addView(
-            makeExitButton(),
+            exitBtn,
             FrameLayout.LayoutParams(
                 (40 * resources.displayMetrics.density).toInt(),
                 (40 * resources.displayMetrics.density).toInt()
             ).apply {
-                gravity = Gravity.TOP or Gravity.END
+                gravity = Gravity.TOP or Gravity.START
                 val m = (10 * resources.displayMetrics.density).toInt()
                 setMargins(m, m, m, m)
             }
         )
+        // root 此刻还没测量，拿不到可用宽高 —— 等布局完成再按保存的比例落位
+        root.post { placeExitButton(root, exitBtn) }
+        // 转屏/分屏会改变可用尺寸：只在尺寸真的变了时重排，
+        // 否则每次 WebView 内部布局都会把用户刚拖好的位置重置一遍。
+        root.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, orr, ob ->
+            val sizeChanged = (r - l) != (orr - ol) || (b - t) != (ob - ot)
+            if (sizeChanged) placeExitButton(root, exitBtn)
+        }
         setContentView(root)
 
         // 清掉上次运行遗留的挑选临时文件（选图时复制的副本会一直占 cache）
@@ -277,8 +302,26 @@ class DshWebActivity : ComponentActivity() {
         }
     }
 
-    /** 右上角小圆钮：关闭网页窗口，回到启动器。 */
-    private fun makeExitButton(): TextView {
+    /**
+     * 网页窗口里那个悬浮「✕」关闭键。
+     *
+     * ## 为什么要做成可拖动 + 静置半透明
+     *
+     * 它原先钉死在右上角（40dp 实心圆，不透明）。而 dsh 页面自己的顶栏、
+     * 章节折叠按钮、设置入口也都在右上角 —— 直接压住对方的控件，点不到。
+     * dsh 的 UI 还会随版本变，写死一个角落迟早挡到别的东西。
+     *
+     * 所以这一版：
+     *  · 静置时半透明（[EXIT_IDLE_ALPHA]），不抢视觉；
+     *  · 按住立刻变实，明确「抓到了」；
+     *  · 可拖到任意位置，避开挡住的控件；
+     *  · **单击仍然是关闭** —— 拖动与单击靠移动距离区分，
+     *    手指抖几像素不会被误判成拖动。
+     *
+     * 位置按比例存进偏好（见 [LauncherPrefs.getWebExitButtonPos]），
+     * 下次打开窗口仍在用户放的地方。
+     */
+    private fun makeExitButton(root: FrameLayout): View {
         val d = resources.displayMetrics.density
         val btn = TextView(this)
         btn.text = "✕"
@@ -291,8 +334,94 @@ class DshWebActivity : ComponentActivity() {
         btn.background = bg
         btn.elevation = 4 * d
         btn.isClickable = true
+        btn.alpha = EXIT_IDLE_ALPHA
         btn.setOnClickListener { finish() }
+
+        // 触摸抖动阈值。用系统值而不是写死像素：各设备密度不同，
+        // 写死会让某些机型稍微一碰就被判成拖动、点不动关闭。
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        var downRawX = 0f
+        var downRawY = 0f
+        var startLeft = 0
+        var startTop = 0
+        var dragging = false
+
+        btn.setOnTouchListener { v, ev ->
+            val lp = v.layoutParams as? FrameLayout.LayoutParams
+                ?: return@setOnTouchListener false
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downRawX = ev.rawX
+                    downRawY = ev.rawY
+                    startLeft = lp.leftMargin
+                    startTop = lp.topMargin
+                    dragging = false
+                    v.animate().alpha(1f).setDuration(80).start()
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = ev.rawX - downRawX
+                    val dy = ev.rawY - downRawY
+                    if (!dragging && (abs(dx) > slop || abs(dy) > slop)) {
+                        dragging = true
+                    }
+                    if (dragging) {
+                        // 夹在容器内，避免拖出屏幕后找不回来
+                        val maxLeft = (root.width - v.width).coerceAtLeast(0)
+                        val maxTop = (root.height - v.height).coerceAtLeast(0)
+                        lp.leftMargin = (startLeft + dx).toInt().coerceIn(0, maxLeft)
+                        lp.topMargin = (startTop + dy).toInt().coerceIn(0, maxTop)
+                        v.layoutParams = lp
+                    }
+                    true
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.animate().alpha(EXIT_IDLE_ALPHA).setDuration(160).start()
+                    if (dragging) {
+                        saveExitButtonPos(root, v)
+                    } else if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                        // 没拖动 → 当作单击。OnTouchListener 返回 true 会吃掉
+                        // 默认的点击派发，所以这里必须自己调 performClick()。
+                        v.performClick()
+                    }
+                    true
+                }
+
+                else -> false
+            }
+        }
         return btn
+    }
+
+    /**
+     * 按保存的比例把关闭键放回上次的位置；没有记录时落在右上角。
+     *
+     * 必须在 root 完成布局后调用 —— 之前拿不到宽高，
+     * 算出来的边距只能是 0，按钮会跑进左上角。
+     */
+    private fun placeExitButton(root: FrameLayout, btn: View) {
+        val lp = btn.layoutParams as? FrameLayout.LayoutParams ?: return
+        val (fx, fy) = LauncherPrefs.getWebExitButtonPos(this)
+        val maxLeft = (root.width - btn.width).coerceAtLeast(0)
+        val maxTop = (root.height - btn.height).coerceAtLeast(0)
+        lp.leftMargin = (fx * maxLeft).toInt()
+        lp.topMargin = (fy * maxTop).toInt()
+        btn.layoutParams = lp
+    }
+
+    /** 把当前位置归一化成 0..1 存起来，供下次打开时还原。 */
+    private fun saveExitButtonPos(root: FrameLayout, btn: View) {
+        val lp = btn.layoutParams as? FrameLayout.LayoutParams ?: return
+        // 用 1 兜底避免除零：可用空间为 0 时保存 0 没有意义，保留原值更安全
+        val maxLeft = (root.width - btn.width).coerceAtLeast(1)
+        val maxTop = (root.height - btn.height).coerceAtLeast(1)
+        LauncherPrefs.setWebExitButtonPos(
+            this,
+            lp.leftMargin.toFloat() / maxLeft,
+            lp.topMargin.toFloat() / maxTop
+        )
     }
 
     // ------------------------------------------------------------------

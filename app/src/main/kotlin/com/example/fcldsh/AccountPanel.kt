@@ -425,17 +425,41 @@ private fun ThirdPartyDialog(onDismiss: () -> Unit, onCreated: () -> Unit) {
     var name by remember { mutableStateOf("") }
     var protocol by remember { mutableStateOf(AccountStore.Protocol.OPENAI) }
     var base by remember { mutableStateOf(AccountStore.Protocol.OPENAI.defaultBase) }
-    var model by remember { mutableStateOf(AccountStore.Protocol.OPENAI.defaultModel) }
     var key by remember { mutableStateOf("") }
+
+    // ── 路由键 ────────────────────────────────────────────────────────
+    //
+    // 这是 dsh `settings.yaml` 里 `llm-pi-ai.providers.<路由键>` 的那个键，
+    // 并且要派生成环境变量名（`XXX_API_KEY`），所以受 dsh 的命名规范约束：
+    // **只用小写字母、数字、连字符**。
+    //
+    // 默认跟着「名称」自动推，用户不用管；手动改过之后就不再跟着变 ——
+    // 否则改个名字会把已经调好的路由键冲掉。
+    var routeKey by remember { mutableStateOf("") }
+    var routeKeyTouched by remember { mutableStateOf(false) }
+
+    // ── 模型 ──────────────────────────────────────────────────────────
+    //
+    // ★ 只能从端点拉回来的列表里选，不再是自由输入 ★
+    //
+    // 第三方网关的模型名是它自己的命名，手填几乎必然拼错，而 dsh 侧报的是
+    // `UNKNOWN_MODEL`，用户根本看不出是拼写问题。所以这里先拉列表再选。
+    var models by remember { mutableStateOf<List<String>>(emptyList()) }
+    var model by remember { mutableStateOf("") }
+
+    var fetching by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
 
-    // 切协议时把地址与模型换成该协议的默认值 —— 但要**先问一下**用户改没改过：
+    // 切协议时把地址换成该协议的默认值 —— 但要**先问一下**用户改没改过：
     // 没改过就跟着换（省事），改过就保留（不覆盖用户输入）。
     var touched by remember { mutableStateOf(false) }
 
-    val canSubmit = name.isNotBlank() && base.isNotBlank() &&
-        key.isNotBlank() && model.isNotBlank() && !busy
+    val canFetch = base.isNotBlank() && key.isNotBlank() && !fetching && !busy
+    val routeKeyOk = AccountStore.isValidRouteKey(routeKey)
+
+    val canSubmit = name.isNotBlank() && base.isNotBlank() && key.isNotBlank() &&
+        model.isNotBlank() && routeKeyOk && !busy && !fetching
 
     Dialog(
         onDismissRequest = { if (!busy) onDismiss() },
@@ -461,7 +485,7 @@ private fun ThirdPartyDialog(onDismiss: () -> Unit, onCreated: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "创建前会发一次最小请求验证密钥与地址是否可用。",
+                    text = "先拉取模型列表再选择；模型名与路由键会写进 dsh 的提供方配置。",
                     color = Fcl.TextTertiary,
                     fontSize = 10.sp,
                     lineHeight = 15.sp
@@ -472,7 +496,13 @@ private fun ThirdPartyDialog(onDismiss: () -> Unit, onCreated: () -> Unit) {
                     label = "名称",
                     value = name,
                     placeholder = "给这个用户起个名字",
-                    onChange = { name = it }
+                    onChange = {
+                        name = it
+                        // 路由键没被手动改过时跟着名字走，省掉一个必填项
+                        if (!routeKeyTouched) {
+                            routeKey = AccountStore.sanitizeRouteKey(it)
+                        }
+                    }
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
@@ -487,10 +517,10 @@ private fun ThirdPartyDialog(onDismiss: () -> Unit, onCreated: () -> Unit) {
                                 .clip(RoundedCornerShape(Fcl.Radius))
                                 .fclClickable {
                                     protocol = p
-                                    if (!touched) {
-                                        base = p.defaultBase
-                                        model = p.defaultModel
-                                    }
+                                    if (!touched) base = p.defaultBase
+                                    // 换协议 = 换端点，旧列表作废，逼用户重新拉一次
+                                    models = emptyList()
+                                    model = ""
                                 },
                             shape = RoundedCornerShape(Fcl.Radius),
                             color = if (on) Fcl.Theme else Fcl.Track
@@ -526,13 +556,26 @@ private fun ThirdPartyDialog(onDismiss: () -> Unit, onCreated: () -> Unit) {
 
                 Spacer(modifier = Modifier.height(10.dp))
                 FormField(
-                    label = "模型",
-                    value = model,
-                    placeholder = protocol.defaultModel,
+                    label = "路由键",
+                    value = routeKey,
+                    placeholder = "my-gateway",
                     onChange = {
-                        model = it
-                        touched = true
+                        // 边输边纠偏：大写转小写、下划线转连字符，
+                        // 让用户直接看到最终会写进 dsh 的样子
+                        routeKey = AccountStore.sanitizeRouteKey(it)
+                        routeKeyTouched = true
                     }
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (routeKeyOk) {
+                        "dsh 里显示为「$routeKey」，密钥变量 ${AccountStore.apiKeyEnvFor(routeKey)}"
+                    } else {
+                        "只能用小写字母、数字和连字符，且不能与 dsh 内置提供方重名"
+                    },
+                    color = if (routeKeyOk) Fcl.TextTertiary else Fcl.Danger,
+                    fontSize = 10.sp,
+                    lineHeight = 14.sp
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
@@ -543,6 +586,136 @@ private fun ThirdPartyDialog(onDismiss: () -> Unit, onCreated: () -> Unit) {
                     secret = true,
                     onChange = { key = it }
                 )
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(text = "模型", color = Fcl.TextPrimary, fontSize = 12.sp)
+                    Spacer(modifier = Modifier.weight(1f))
+                    // 拉取按钮。协议 + 地址 + 密钥都齐了才让点 —— 缺一样都是白跑一趟网络
+                    if (fetching) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.width(12.dp).height(12.dp),
+                            strokeWidth = 2.dp,
+                            color = Fcl.Theme
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(text = "拉取中…", color = Fcl.TextSecondary, fontSize = 11.sp)
+                    } else {
+                        AccountAction(
+                            text = if (models.isEmpty()) "拉取模型列表" else "重新拉取",
+                            enabled = canFetch,
+                            onClick = {
+                                error = ""
+                                fetching = true
+                                val draft = AccountStore.Account(
+                                    id = UUID.randomUUID().toString(),
+                                    name = name.trim().ifBlank { "draft" },
+                                    kind = AccountStore.AccountKind.THIRD_PARTY,
+                                    protocol = protocol,
+                                    baseUrl = base.trim(),
+                                    apiKey = key.trim(),
+                                    model = "",
+                                    routeKey = routeKey
+                                )
+                                Thread {
+                                    val r = AccountStore.discoverModels(draft)
+                                    Handler(Looper.getMainLooper()).post {
+                                        fetching = false
+                                        when (r) {
+                                            is AccountStore.ModelListResult.Ok -> {
+                                                models = r.models
+                                                // 之前选的还在新列表里就保留，否则落到第一个
+                                                if (r.models.none { it == model }) {
+                                                    model = r.models.firstOrNull().orEmpty()
+                                                }
+                                            }
+                                            is AccountStore.ModelListResult.Fail -> {
+                                                models = emptyList()
+                                                model = ""
+                                                error = "拉取模型列表失败：${r.reason}"
+                                            }
+                                        }
+                                    }
+                                }.start()
+                            }
+                        )
+                    }
+                }
+
+                when {
+                    fetching -> {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "正在向 ${base.ifBlank { "端点" }} 询问可用模型…",
+                            color = Fcl.TextTertiary,
+                            fontSize = 10.sp,
+                            lineHeight = 14.sp
+                        )
+                    }
+
+                    models.isEmpty() -> {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "填好地址与密钥后点「拉取模型列表」。模型必须从列表里选，" +
+                                "手填的模型名 dsh 会以 UNKNOWN_MODEL 拒绝。",
+                            color = Fcl.TextTertiary,
+                            fontSize = 10.sp,
+                            lineHeight = 14.sp
+                        )
+                    }
+
+                    else -> {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        // 限高 + 内部滚动：模型多的时候（有的网关几十个）
+                        // 不能把下面的按钮顶出屏幕
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 150.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            models.forEach { m ->
+                                val on = m == model
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(Fcl.Radius))
+                                        .fclClickable { model = m }
+                                        .padding(horizontal = 6.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // 选中态用一个小圆点标出来，不引入额外控件
+                                    Box(
+                                        modifier = Modifier
+                                            .width(6.dp)
+                                            .height(6.dp)
+                                            .clip(RoundedCornerShape(3.dp))
+                                    ) {
+                                        Surface(
+                                            modifier = Modifier.fillMaxSize(),
+                                            color = if (on) Fcl.Theme else Fcl.Line
+                                        ) {}
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = m,
+                                        color = if (on) Fcl.ThemeText else Fcl.TextSecondary,
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "共 ${models.size} 个模型" +
+                                (if (model.isNotBlank()) "，已选 $model" else ""),
+                            color = Fcl.TextTertiary,
+                            fontSize = 10.sp
+                        )
+                    }
+                }
 
                 if (error.isNotBlank()) {
                     Spacer(modifier = Modifier.height(10.dp))
@@ -588,7 +761,10 @@ private fun ThirdPartyDialog(onDismiss: () -> Unit, onCreated: () -> Unit) {
                                 protocol = protocol,
                                 baseUrl = base.trim(),
                                 apiKey = key.trim(),
-                                model = model.trim()
+                                model = model.trim(),
+                                // ★ 必须带上：不带的话路由键会退化成从名字现推，
+                                // 和用户刚才在输入框里看到（并可能改过）的那个不一致
+                                routeKey = routeKey
                             )
                             Thread {
                                 val result = AccountStore.check(draft)
@@ -599,7 +775,8 @@ private fun ThirdPartyDialog(onDismiss: () -> Unit, onCreated: () -> Unit) {
                                             AccountStore.add(context, draft)
                                             DSHRunner.onLog(
                                                 "✅ 已添加用户「${draft.name}」" +
-                                                    "（${protocol.label}）"
+                                                    "（${protocol.label} · 路由 ${draft.effectiveRouteKey}" +
+                                                    " · 模型 ${draft.model}）"
                                             )
                                             onCreated()
                                         }

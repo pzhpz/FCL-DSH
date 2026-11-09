@@ -2,7 +2,40 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.example.fcldsh">
-    
+
+    <!--
+        ★ 必须显式放行 Shizuku 三个库的 minSdk 检查 ★
+
+        `dev.rikka.shizuku:api/provider/shared:13.1.5` 的 AAR 声明 `minSdk 24`，
+        而本项目是 23（targetSdk 28，为拿到 filesDir 内文件的可执行豁免）。
+        不 override 的话 manifest 合并直接失败：
+        `uses-sdk:minSdkVersion 23 cannot be smaller than version 24 declared in library`。
+
+        为什么放行是安全的：**这些类只在 Shizuku 模式下才会被加载**，
+        而 [com.example.fcldsh.Privilege] 里每一处都先过
+        `Build.VERSION.SDK_INT >= 24` 并且整段包在 runCatching 内。
+        Android 6 设备上拿到的只是「Shizuku 不可用」，不会 NoClassDefFoundError。
+
+        ⚠️ 以后若把 Shizuku 相关调用挪到没有 SDK 门禁的地方，
+        这段 override 就会变成真实崩溃源。改代码时请一并检查。
+    -->
+    <uses-sdk tools:overrideLibrary="rikka.shizuku.api,rikka.shizuku.provider,rikka.shizuku.shared" />
+
+    <!--
+        ★ 这一条漏了，Shizuku 就永远显示「未授权」★
+
+        Shizuku 的 `Shizuku.checkSelfPermission()` 实际查的是
+        `moe.shizuku.manager.permission.API_V23` 这个由 Shizuku Manager 声明的权限。
+        **只有在本应用 manifest 里先声明它**，用户在 Shizuku 里点「允许」时
+        系统才会把该权限记到本应用头上；不声明的话，这个权限对本应用
+        「不存在」，`checkSelfPermission()` 恒返回 DENIED ——
+        表现就是「明明授权了，界面一直显示未授权」。
+
+        这条不参与运行时弹窗（它不是普通 runtime permission 的用法），
+        只是让「授权记录」能落到本应用身上，所以不需要任何申请代码。
+    -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!--
@@ -114,6 +147,24 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|fontScale|locale|layoutDirection" />
 
         <!--
+            应用内的配置文件编辑页。
+
+            为什么需要：dsh 网页设置里的「打开配置文件」把路径交给**桌面**程序
+            （macOS `open -t` / Windows 资源管理器 / Linux `xdg-open`），
+            Android 三者皆无，于是前端只能显示「无法打开配置文件」。
+            那个按钮在网页侧修不了，所以把等价能力放进应用里。
+
+            * exported=false：只由本应用的设置页拉起。
+            * 自己接管 configChanges：页面持有编辑中的文本，
+              重建会把未保存的改动清空 —— 对编辑 YAML/JSON 来说等于丢数据。
+        -->
+        <activity
+            android:name=".ConfigEditorActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|fontScale|locale|layoutDirection" />
+
+        <!--
             引擎下载/安装期间的前台保活服务。
             stopWithTask=false：用户从最近任务里划掉启动器后，下载仍应继续。
             类型必须是 dataSync（Android 14+ 强制），否则 startForeground 抛异常。
@@ -199,6 +250,59 @@
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
+        </provider>
+
+        <!--
+            ★★★ Shizuku 的 binder 通道 —— 漏了它，Shizuku 就完全不通 ★★★
+
+            Shizuku 不是「查询一下状态」那么简单：它把 binder 通过**一个
+            ContentProvider** 递给应用。`rikka.shizuku:provider` 构件里带着
+            `rikka.shizuku.ShizukuProvider`，必须在 manifest 里注册，
+            Shizuku 服务端才会在它启动时通过这个 provider 把 binder 塞进来。
+
+            不注册的后果（四个现象一次全中，本项目实测）：
+            1. `Shizuku.pingBinder()` 恒 false；
+            2. `Shizuku.getBinder()` 恒 null，于是 `checkSelfPermission()`
+               恒返回 DENIED —— 用户在 Shizuku 里**明明勾选了本应用**，
+               界面却一直显示「未授权」；
+            3. `Shizuku.requestPermission()` 什么都不会弹出来 ——
+               它要靠 binder 去通知 Shizuku 服务端弹框，没有 binder 就静默失败；
+            4. `addBinderReceivedListenerSticky` 永远不回调。
+
+            三个属性的理由（`ShizukuProvider.attachInfo()` 里是**硬性校验**，
+            写错不是静默失效，而是直接抛 IllegalStateException 让应用崩溃）：
+            · authorities 必须是 `${applicationId}.shizuku` —— 这是 Shizuku
+              服务端写死的约定，名字不对它就不认；
+            · exported=true：跨进程（Shizuku 的进程调本应用的 provider）；
+            · multiprocess=false：服务端只在**应用进程启动时**取一次 uid；
+            · permission=INTERACT_ACROSS_USERS_FULL：防止任意第三方应用
+              冒充 Shizuku 往本 provider 里塞东西，这是官方要求的安全约束。
+
+            ★★ meta-data 是**必须**的，漏了就永远收不到 binder ★★
+
+            binder 的投递方向与直觉相反：不是应用来拿，而是 **Shizuku 服务端
+            主动调本 provider 的 `call("sendBinder", …)` 塞进来**。服务端在
+            扫描已安装应用时，会读 provider 上的 `moe.shizuku.client.VERSION_CODE`
+            来判断这个客户端能不能用 ——
+            **读不到就跳过该应用、不投递 binder**。
+
+            而 `pingBinder()` 恒 false → `getBinder()` 恒 null →
+            `checkSelfPermission()` 恒 DENIED → `requestPermission()` 弹不出框 →
+            整条链路全死。用户看到的就是「授权也勾了、服务也在跑，但什么都不生效」。
+
+            这个值要与所用 Shizuku 客户端库匹配：13.1.5 对应 **13**。
+            参考项目（Deepseek-Harness-Local-Android）同样写的是 13。
+        -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL">
+            <meta-data
+                android:name="moe.shizuku.client.VERSION_CODE"
+                android:value="13" />
         </provider>
     </application>
 </manifest>

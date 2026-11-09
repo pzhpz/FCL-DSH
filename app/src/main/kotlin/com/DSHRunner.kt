@@ -2,13 +2,22 @@ package com
 
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import com.example.fcldsh.AccountStore
 import com.example.fcldsh.AgentGuide
+import com.example.fcldsh.DshProviderConfig
+import com.example.fcldsh.FsLocalPatch
 import com.example.fcldsh.Instances
 import com.example.fcldsh.LauncherPrefs
+import com.example.fcldsh.OpenSslEnv
 import com.example.fcldsh.PermissionMode
+import com.example.fcldsh.PrivMode
+import com.example.fcldsh.Privilege
+import com.example.fcldsh.PtySupport
 import com.example.fcldsh.RequireBuiltinShim
 import com.example.fcldsh.SandboxBackend
+import com.example.fcldsh.ShellEnvFix
+import com.example.fcldsh.ShizukuBridge
 import java.io.File
 import java.io.FileOutputStream
 import java.net.InetSocketAddress
@@ -112,6 +121,16 @@ object DSHRunner {
         val port = currentPort
         currentPort = 0
 
+        // ── 刻意**不**在这里关掉 Shizuku 通道 ────────────────────────────
+        //
+        // 早先这里会 `ShizukuBridge.stop()`，理由是「引擎停了就没人用 shz」。
+        // 那造成了一个很隐蔽的坑：用户为了跑 `shz id` 去启动引擎，停止后
+        // 通道被关、状态文件写成 `port: 0`，于是 `shz` 又变成「通道不可用」——
+        // 一个本该与引擎无关的能力，被引擎生命周期牵着走。
+        //
+        // 现在桥的生命周期只跟 **Shizuku 是否可用** 绑定（见
+        // [com.example.fcldsh.ShizukuBridge.watchState] / `reconcile`）：
+        // 引擎停了也不关，引擎起来也不重绑（幂等）。
         if (p == null) {
             onLog("⏹ 没有正在运行的进程")
             if (port != 0) onLog("   （上次记录的端口 $port 将自动避开）")
@@ -312,132 +331,6 @@ object DSHRunner {
         }
     }
 
-    /**
-     * 扫描引擎目录，找出 flock 报错的出处。
-     *
-     * 为什么需要它：报错 `flock is not supported on android-arm64` 是 JS 抛的，
-     * 但 dsh 有几十个包，光靠猜没法定位。这里直接按文本搜，
-     * 把「哪个文件、哪一行」打出来，才能决定改哪里。
-     *
-     * 为了在手机上跑得动，做了这些限制：
-     * - 只扫 `.js/.cjs/.mjs`，跳过二进制与源码映射
-     * - 跳过 `npm` 自身（几万文件且与业务无关）和 `@vscode/ripgrep`
-     * - 单文件超过 4MB 跳过（压缩产物里通常不会有这种可读文案）
-     * - 命中 10 处就停，避免刷屏
-     */
-    fun scanFlockSource(context: Context) {
-        val usr = usrDir(context)
-        val root = File(usr, "lib/node_modules")
-        if (!root.isDirectory) {
-            onLog("❌ 找不到 lib/node_modules，引擎可能未安装")
-            return
-        }
-
-        onLog("──── 扫描 flock 来源 ────")
-        onLog("目录: ${root.absolutePath}")
-
-        val skipDirs = setOf("npm", "corepack", "pnpm", "@vscode")
-        val maxFileSize = 4L * 1024 * 1024
-        var scanned = 0
-        var hits = 0
-        val hitLimit = 10
-        val keywords = listOf("flock is not supported", "not supported on")
-
-        fun walk(dir: File, depth: Int) {
-            if (hits >= hitLimit || depth > 8) return
-            val items = runCatching { dir.listFiles() }.getOrNull() ?: return
-            for (f in items) {
-                if (hits >= hitLimit) return
-                if (f.isDirectory) {
-                    // 跳过与业务无关的大目录
-                    if (f.parentFile == root && f.name in skipDirs) continue
-                    if (f.name == "@vscode") continue
-                    walk(f, depth + 1)
-                    continue
-                }
-                val name = f.name
-                if (!name.endsWith(".js") && !name.endsWith(".cjs") && !name.endsWith(".mjs")) {
-                    continue
-                }
-                val len = runCatching { f.length() }.getOrDefault(0L)
-                if (len == 0L || len > maxFileSize) continue
-
-                scanned++
-                val text = runCatching { f.readText() }.getOrNull() ?: continue
-                for (kw in keywords) {
-                    val idx = text.indexOf(kw)
-                    if (idx < 0) continue
-                    // 取命中处前后一小段，足以看出是哪个包在抛
-                    val from = (idx - 120).coerceAtLeast(0)
-                    val to = (idx + 120).coerceAtMost(text.length)
-                    val snippet = text.substring(from, to)
-                        .replace('\n', ' ')
-                        .replace(Regex("\\s+"), " ")
-                    onLog("📍 ${f.absolutePath}")
-                    onLog("   «$snippet»")
-                    hits++
-                    break
-                }
-            }
-        }
-
-        walk(root, 0)
-        onLog("──── 扫描结束：检查 $scanned 个文件，命中 $hits 处 ────")
-        if (hits == 0) {
-            onLog("未在 JS 文件里找到该文案；要检查可选依赖是否缺失，再点「检查平台可选包」")
-        }
-    }
-
-    /**
-     * 列出已安装的平台相关可选包。
-     *
-     * 引擎是用 `--omit=optional` 装的，npm 会跳过 `@xxx/linux-arm64` 这类
-     * 平台专属可选依赖。若 flock 来自某个原生文件锁包，其平台包没装上，
-     * 加载器就会抛那条报错。这里把已装的列出来，与「应该有」对照即可判断。
-     */
-    fun listPlatformPackages(context: Context) {
-        val root = File(usrDir(context), "lib/node_modules")
-        onLog("──── 平台相关可选包 ────")
-        if (!root.isDirectory) {
-            onLog("❌ 找不到 lib/node_modules")
-            return
-        }
-
-        val markers = listOf(
-            "linux-arm64", "linux-x64", "android-arm64",
-            "darwin-arm64", "darwin-x64", "win32-x64"
-        )
-        var found = 0
-
-        fun walkForScopes(dir: File, depth: Int) {
-            if (depth > 6) return
-            val items = runCatching { dir.listFiles() }.getOrNull() ?: return
-            for (f in items) {
-                if (!f.isDirectory) continue
-                if (f.name.startsWith("@")) {
-                    // 作用域目录：列出内部名字含平台标记的包
-                    runCatching { f.listFiles() }.getOrNull()?.forEach { pkg ->
-                        if (pkg.isDirectory && markers.any { pkg.name.contains(it) }) {
-                            onLog("✔ ${f.name}/${pkg.name}")
-                            found++
-                        }
-                    }
-                    walkForScopes(f, depth + 1)
-                } else if (markers.any { f.name.contains(it) }) {
-                    onLog("✔ ${f.name}")
-                    found++
-                }
-            }
-        }
-
-        walkForScopes(root, 0)
-        if (found == 0) {
-            onLog("未发现任何平台专属包 —— 很可能就是 --omit=optional 把它们跳过了")
-        } else {
-            onLog("共 $found 个")
-        }
-    }
-
     /** 跑一个 node 脚本并返回 stdout（同步，供诊断用）。 */
     private fun runNode(
         context: Context,
@@ -456,6 +349,9 @@ object DSHRunner {
             put("TMPDIR", File(context.cacheDir, "tmp").apply { mkdirs() }.absolutePath)
             put("LD_LIBRARY_PATH", File(usr, "lib").absolutePath)
             put("PATH", "${File(usr, "bin").absolutePath}:/system/bin")
+            // 与引擎进程同一份 OpenSSL 配置：诊断脚本里也可能 require('crypto')，
+            // 环境不一致时会出现「引擎正常、诊断挂」的假象。
+            putAll(OpenSslEnv.ensure(usr.absolutePath, onLog))
         }
         val p = pb.start()
         // 关闭子进程 stdin，让任何读 stdin 的操作立即拿到 EOF。
@@ -607,6 +503,31 @@ object DSHRunner {
      * 「第一个 node_modules/」归一化引擎条目，混在一起会互相误判。
      */
     const val DATA_PREFIX = "dsh-data/"
+
+    /**
+     * 导入时必须丢弃的「密钥载体」文件名（相对 `home/.dsh-<版本>`）。
+     *
+     * ## 为什么导入端也要管
+     *
+     * 导出侧（[com.example.fcldsh.EngineExporter]）已经会剔除这两个文件，
+     * 但**用户手里的包可能是旧版本应用导出的** —— 那时它们会原样进包。
+     * 导入方如果照单全收，就会在毫无察觉的情况下用上别人的密钥：
+     * 花钱的是对方的账号，出问题也查不到源头。
+     *
+     * | 文件 | 内容 |
+     * |---|---|
+     * | `.env` | `DEEPSEEK_API_KEY=sk-…` 这类明文密钥 |
+     * | `android-account.json` | 全部账号，每个都带 apiKey 明文 |
+     *
+     * 删掉不影响可用性：[com.example.fcldsh.AccountStore] 下次启动会用
+     * 本机自己的账号重新生成；本机没账号就等用户填。
+     *
+     * 显式标注 `List<String>` 是必需的：无类型推断时 `for (x in …)`
+     * 会因为 `iterator()` 重载过多而报 ambiguous。
+     */
+    private val PACKAGE_SECRET_FILES: List<String> = listOf(
+        ".env", "android-account.json"
+    )
 
     private fun usrDir(context: Context) = File(context.filesDir, USR)
 
@@ -2381,6 +2302,26 @@ object DSHRunner {
 
             if (dataMoved) {
                 runCatching { dataStaging.deleteRecursively() }
+
+                // ── 兜底：丢掉包里可能夹带的密钥载体 ──────────────────────
+                //
+                // 导出侧已经会剔除 `.env` 与 `android-account.json`，但用户手里
+                // 的包可能是**旧版本应用**导出的 —— 那时这两个文件会原样进包。
+                // 导入方如果照单全收，就会在毫无察觉的情况下用上**别人的密钥**：
+                // 花钱的是对方的账号，出问题也查不到源头。
+                //
+                // 删掉不影响可用性：下次启动时 [AccountStore] 会用本机自己的
+                // 账号重新生成这两个文件；本机没有账号就等你填。
+                var dropped = 0
+                for (name in PACKAGE_SECRET_FILES) {
+                    val f = File(dataTarget, name)
+                    if (f.exists() && runCatching { f.delete() }.getOrDefault(false)) dropped++
+                }
+                if (dropped > 0) {
+                    onLog("🔑 已丢弃整合包里的 $dropped 个密钥文件（.env / android-account.json）")
+                    onLog("ℹ️ 本实例将使用本机自己的账号，请在账号页确认后再启动")
+                }
+
                 onLog("✅ 数据目录已恢复：${dataTarget.name}（$dataCount 个文件）")
             } else {
                 runCatching { dataStaging.deleteRecursively() }
@@ -2626,6 +2567,47 @@ object DSHRunner {
             // 用锁文件实现同等语义，绕开原生模块。
             ensureFlockShim(context)
 
+            // ── 终端 PTY 后端（node-pty 的 Android 实现）────────────────────
+            //
+            // 「新建终端」用不了是两层问题：subprocess-local 的进程探测器只认
+            // linux/darwin/win32（Termux 的 node 报 android），而 node-pty 在
+            // Android 没有预编译产物、runtime 里是抛错的空壳。
+            //
+            // 这里在 spawn 之前把随 APK 分发的原生助手落到 $PREFIX/bin，并把
+            // node-pty 换成转发到它的实现 + 给两处平台判断放行 android。
+            //
+            // ★ 为什么放在启动前而不是打包时 ★
+            // 引擎是首启后按需 npm 装的，同一份 runtime 会被装进
+            // lib/versions/<版本>/node_modules；打包时改只能覆盖容器自带的那份，
+            // 换个版本就重新撞上「终端不可用」。这里按磁盘实际布局装配，幂等。
+            //
+            // 失败**不阻断启动**：终端用不了是缺功能，引擎起不来才是事故。
+            PtySupport.ensure(context, prefix, onLog)
+
+            // ── 文件系统适配（dsh-fs-local 的 EACCES 降级）──────────────────
+            //
+            // 「文件资源服务不可用」/某个目录一个文件都列不出来，根因是上游把
+            // Android 共享存储（FUSE）返回的 EACCES 当成致命 IO 故障：一次
+            // stat 失败就让整次目录列举 throw。这里改成「无法观测」，
+            // 并把单个不可读的子项降级成 other，不再中断整个列表。
+            //
+            // 与 PTY 同一原因放在启动前：引擎按版本装在
+            // lib/versions/<版本>/node_modules，打包时改只能覆盖容器那份。
+            FsLocalPatch.ensure(context, prefix, onLog)
+
+            // ── 交互式 shell 的路径与可执行位 ───────────────────────────────
+            //
+            // 终端里报 `command "/data/data/com.termux/files/usr/bin/bash"
+            // is not an executable file` —— dsh 在 Android 上把 shell 解析成了
+            // **Termux 的**私有路径，那是别的 uid 的 0700 目录，本应用连 stat
+            // 都不行。这里把真实容器里的 bash 作为 SHELL 下发，并把已装引擎里
+            // 写死的 Termux 前缀改成本机容器。
+            //
+            // 同时补一次可执行位：`ZipInputStream` 解压不还原 Unix 权限位，
+            // 而 grantExec() 只在首次解压后跑一次；老安装或解压中断过的容器会
+            // 留下没有 +x 的 bash，那时即使路径对了，前置检查也会报同一句话。
+            val shellPath = ShellEnvFix.ensure(context, prefix, onLog)
+
             // ── 原生绑定替身（与 flock 同一思路的第二个实例）───────────────
             //
             // 上游 node-addon-require-builtin 从未发布 android 变体，
@@ -2694,6 +2676,21 @@ object DSHRunner {
             // 清掉迁移过程留下的临时目录（只删 .seed-tmp，绝不碰 .dsh-<ver>）
             val stale = cleanupLegacyIsolation(context)
             if (stale > 0) onLog("🧹 已清理迁移临时目录")
+
+            // ★ 先把 su 探测一次，再写 agent 说明 ★
+            //
+            // AGENTS.md 里要写「你现在是不是 root、有没有 su」。而真正调
+            // `Privilege.usableSuPrefix()` 的地方在下面构造 ProcessBuilder 时，
+            // **晚于** AgentGuide.refresh —— 顺序反过来的话，Root 模式下
+            // 文档会写成「未检测到可用的 su」，把一条正确信息写成错的，
+            // 而 agent 会据此不敢用 root 能力。
+            //
+            // 这里预热一次：探测结果进缓存，后面的启动流程直接复用同一个答案，
+            // 不会出现「文档说有、实际启动又探一遍得不同结果」的分裂。
+            // 本方法运行在工作线程上，允许起子进程。
+            if (Privilege.getMode(context) == PrivMode.ROOT) {
+                runCatching { Privilege.usableSuPrefix() }
+            }
 
             // 在 dsh 起来之前刷新一次 agent 说明（AGENTS.md）。
             //
@@ -2771,6 +2768,16 @@ object DSHRunner {
             currentPort = port
             onLog("监听端口: $port")
 
+            // ── Shizuku 通道（幂等刷新，不依赖引擎端口）────────────────────
+            //
+            // 桥自己占 18091 起的端口段，与引擎端口无关；这里只是「顺手对齐一次」
+            // 状态文件，保证引擎起来后 `shz` 立刻能用。
+            //
+            // 真正的启停由 Shizuku 状态驱动（见 ShizukuBridge.watchState），
+            // 所以这里失败不影响任何东西 —— 也不该影响引擎启动。
+            runCatching { ShizukuBridge.start(context, prefix) }
+                .onFailure { onLog("⚠️ Shizuku 通道对齐失败: ${it.message}") }
+
             // ── 引擎状态自检 ────────────────────────────────────────────
             // 排查 flock 时一直缺少"设备上引擎到底长什么样"的数据，
             // 这里每次启动顺手打几行（只列目录，开销可忽略）。
@@ -2818,16 +2825,50 @@ object DSHRunner {
             }
             args += listOf("--no-open", "--host", "127.0.0.1", "--port", port.toString())
 
-            val pb = ProcessBuilder(args)
-            // cwd 从 "/"（ProcessBuilder 默认继承 App 的不可写 cwd）换成 HOME
-            pb.directory(workDir)
-
-            val env = pb.environment()
+            // ★ 环境变量先收进普通 Map，ProcessBuilder 最后才构造 ★
+            //
+            // 普通模式下它直接灌进 `pb.environment()`；但 Root 模式下命令要经
+            // `su -c "<整行>"` 执行，而 su 没有传环境的能力 —— 变量必须**拼进
+            // 那一行**。若仍用 `pb.environment()`，Root 模式会静默丢掉
+            // PREFIX / HOME / DSH_HOME / NODE_PATH 等全部关键变量，引擎必然起不来。
+            val env = LinkedHashMap<String, String>()
             env["PREFIX"] = prefix
             env["HOME"] = home
             env["TMPDIR"] = tmp
             env["LD_LIBRARY_PATH"] = "$prefix/lib"
             env["PATH"] = "$prefix/bin:/system/bin"
+
+            // ── OpenSSL 的配置入口 ★ 也是「绝对路径依赖」的修法 ★ ──────────
+            //
+            // 容器里的 Node / libssl 是在 Termux 环境里编译的，OPENSSLDIR 被
+            // 写死成 `/data/data/com.termux/files/usr/etc/tls`。而本应用的容器在
+            // `filesDir/usr`：装了 Termux 的设备上那是别人的 0700 私有目录
+            //（EACCES），没装的设备上那路径压根不存在。
+            //
+            // 这里把 `$PREFIX/etc/tls/openssl.cnf` 准备好（缺就写一份最小配置），
+            // 再用 OPENSSL_CONF / SSL_CERT_FILE / NODE_EXTRA_CA_CERTS 指过去，
+            // 让 OpenSSL 一开始就有可读的配置与 CA，不再回落到那个写死的路径。
+            //
+            // ⚠️ 注入严格「文件存在才设」—— 指向不存在的文件比不设更糟，
+            // 详见 OpenSslEnv 的注释。这里也不额外传 `--openssl-config`：
+            // OPENSSL_CONF 已经覆盖同一条链路，多一个参数只是多一个
+            // 「路径算错就整个进程起不来」的失败面。
+            runCatching { OpenSslEnv.ensure(prefix, onLog) }
+                .onSuccess { env.putAll(it) }
+                .onFailure { onLog("⚠️ OpenSSL 环境准备失败: ${it.message}") }
+
+            // ── 交互式 shell ★ 终端用它，不要让它猜 ★ ─────────────────────
+            //
+            // 不设这个变量时，dsh 在 Android 上会退到 Termux 的 bash 路径
+            // （`/data/data/com.termux/files/usr/bin/bash`）—— 那是别的应用的
+            // 私有目录，本应用连 stat 都会 EACCES，终端于是报
+            // 「command "..." is not an executable file」。
+            //
+            // 只认容器里真实存在的那一个；万一不存在就退回系统的 sh，
+            // 至少能起一个能用的终端而不是继续报错。
+            env["SHELL"] = shellPath ?: "/system/bin/sh"
+            Log.i("DSH-runner", "SHELL=${env["SHELL"]}")
+
             // ── 把容器的 node_modules 显式挂进解析链 ★ 必须 ★ ─────────────
             //
             // ## 修的是什么
@@ -2898,6 +2939,29 @@ object DSHRunner {
                 AccountStore.describeForLog()?.let { onLog("账号: $it") }
             }.onFailure { onLog("⚠️ 账号注入失败: ${it.message}") }
 
+            // ── 第三方密钥：在 dsh 的 settings.yaml 里补一条提供方路由 ──────
+            //
+            // ★ 为什么环境变量不够，还必须写这里 ★
+            //
+            // 上面注入的 `*_API_KEY` 只解决「凭据在不在」，不解决「dsh 知不知
+            // 道这个端点」。第三方中转站不是 pi-ai 内置的任何一条路由，光有 key
+            // 的话 dsh 只会拿它去连官方域名 —— 这正是「创建成功了但 dsh 里没有」
+            // 的根因。声明一条 `llm-pi-ai.providers.<路由>`，端点与模型才有归宿。
+            //
+            // ★ 只添加，不覆盖 ★
+            //
+            // 路由名撞上已有配置时 DshProviderConfig 直接跳过（不写一个字节），
+            // 官方账号也整个跳过（走 dsh 内置 deepseek 路由）。详见该文件的注释。
+            runCatching {
+                val acc = AccountStore.selected()
+                if (acc != null) {
+                    // 必须用**实际下发给进程**的那个目录（dshHomeDir），
+                    // 不要另推一遍 dshHome(context) —— 记忆里「多个调用点各自
+                    // 推导同一个根路径」那条铁律就是踩过的坑。
+                    onLog(DshProviderConfig.describe(DshProviderConfig.applyTo(dshHomeDir, acc)))
+                }
+            }.onFailure { DshProviderConfig.logFailure(it) }
+
             onLog("cwd: ${workDir.absolutePath}")
             onLog("Documents: ${documentsDir.absolutePath}")
             onLog("xdg shim: ${xdgShim.absolutePath}")
@@ -2924,6 +2988,51 @@ object DSHRunner {
 
             // 这一次是全新启动：清掉上次的「正在停止」标记与残留输出，
             // 否则上一次主动停止留下的 stopping=true 会让这次崩溃被当成正常退出。
+            // ── 按运行权限模式构造 ProcessBuilder ★ 必须在这里，不能更早 ★ ──
+            //
+            // 上面所有 env[...] 都只是往 Map 里写；到这里才决定「怎么把这份
+            // 环境交给引擎」。两种模式的差别不只是多一层 su：
+            // 普通模式能把环境作为**进程属性**传下去，Root 模式只能拼成命令行。
+            val privMode = Privilege.getMode(context)
+            val pb: ProcessBuilder = if (privMode == PrivMode.ROOT) {
+                val suPrefix = Privilege.usableSuPrefix()
+                if (suPrefix == null) {
+                    // 没 su 就**不要**退回普通模式：用户明确选了 Root，
+                    // 静默降级会让他以为「Restricted 模式生效了」，然后在
+                    // 一个没有 root 的环境里执行本该高权限的命令 —— 更难排查。
+                    Privilege.invalidateSuCache()
+                    onLog("❌ 已选 Root 模式，但本机没有可用的 su")
+                    onLog("❌ 请在「设置 → 运行权限」切回普通模式，或先授权 su")
+                    return
+                }
+                // 整行命令：cd → env 注入 → exec 真正的 argv。
+                // 每个片段都必须过 shellQuote：路径里出现 $、反引号、空格或
+                // 单引号时，不引用就会被 shell 当成语法而不是字面量。
+                val cmdline = buildString {
+                    append("cd ").append(Privilege.shellQuote(workDir.absolutePath))
+                        .append(" && exec env")
+                    env.forEach { (k, v) ->
+                        append(' ').append(Privilege.shellQuote("$k=$v"))
+                    }
+                    args.forEach { append(' ').append(Privilege.shellQuote(it)) }
+                }
+                onLog("⚠️ Root 模式：引擎将以 uid 0 运行（su ${suPrefix.joinToString(" ")}）")
+                Log.i("DSH-runner", "root launch via ${suPrefix.joinToString(" ")}")
+                ProcessBuilder(*(suPrefix + listOf(cmdline)).toTypedArray())
+            } else {
+                if (privMode == PrivMode.SHIZUKU) {
+                    // 引擎本体仍是 App 身份 —— Shizuku 授予的是本进程的 binder
+                    // 能力，改不了 fork 出来的子进程 uid。这条日志是为了让
+                    // 「选了 Shizuku 但 ps 里还是 u0_aXXX」不至于被当成 bug。
+                    onLog("ℹ️ Shizuku 模式：引擎仍以 App 身份运行（Shizuku 不改变子进程 uid）")
+                }
+                ProcessBuilder(args).apply {
+                    // cwd 从 "/"（ProcessBuilder 默认继承 App 的不可写 cwd）换成 HOME
+                    directory(workDir)
+                    environment().putAll(env)
+                }
+            }
+
             stopping = false
             synchronized(recentOutput) { recentOutput.clear() }
 

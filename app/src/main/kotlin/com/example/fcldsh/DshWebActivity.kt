@@ -264,8 +264,21 @@ class DshWebActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    /** 网页能后退就后退，退无可退才关窗口回到启动器。 */
-    @Suppress("DEPRECATION")
+    /**
+     * 网页能后退就后退，退无可退才关窗口回到启动器。
+     *
+     * ⚠️ 这里**故意**继续用 `onBackPressed()` 而不是
+     * `OnBackPressedDispatcher`：本 Activity 被系统以
+     * `singleInstance` 方式拉起，返回键语义要与 WebView 历史严格绑定，
+     * 而 Compose 侧的 `BackHandler` 只对 Compose 内容生效，
+     * 覆盖不到 WebView 自己的历史栈。等确认迁移不影响手势返回再换。
+     *
+     * 两个 suppression 缺一不可：
+     * - `DEPRECATION`：`super.onBackPressed()` 本身已过时；
+     * - `OVERRIDE_DEPRECATION`：重写一个已过时的成员，编译器单独提示
+     *   「重写者自身没有标注 @Deprecated」。
+     */
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         if (::webView.isInitialized && webView.canGoBack()) {
             webView.goBack()
@@ -280,10 +293,21 @@ class DshWebActivity : ComponentActivity() {
         if (hasFocus) enterImmersive()
     }
 
-    /** 隐藏状态栏与导航栏，边缘划入时临时浮现。 */
+    /**
+     * 隐藏状态栏与导航栏，边缘划入时临时浮现。
+     *
+     * `setDecorFitsSystemWindows` 在 API 35 起被标记过时（官方推荐
+     * `enableEdgeToEdge()`），但本项目 minSdk 23、targetSdk 34，
+     * 且这里配合 `insetsController.hide(systemBars())` 使用，
+     * 行为与预期一致 —— 换新 API 属于另一件事，不在修告警的范围里。
+     */
+    @Suppress("DEPRECATION")
     private fun enterImmersive() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false)
+            // 放在 run{} 里、让注解直接贴住调用表达式 —— 这是本工程里
+            // 唯一实测能压住 Java 过时 API 告警的写法（见 EngineTaskService
+            // 里 WIFI_MODE_FULL_HIGH_PERF 那处）。写在函数上或语句上方都无效。
+            run { @Suppress("DEPRECATION") window.setDecorFitsSystemWindows(false) }
             window.insetsController?.let { c ->
                 c.hide(android.view.WindowInsets.Type.systemBars())
                 c.systemBarsBehavior =
@@ -428,6 +452,15 @@ class DshWebActivity : ComponentActivity() {
     // WebView 配置
     // ------------------------------------------------------------------
 
+    /**
+     * WebView 全局配置。
+     *
+     * `databaseEnabled` 自 API 33 起过时（WebSQL 数据库已移除，设它无效），
+     * 但 API 23–32 上它仍是唯一的开关，去掉会改变老设备上页面的存储能力。
+     * 保留调用，仅在这一处压制告警 —— 不要提升到文件级，否则会把
+     * 真正需要处理的过时 API 一起遮掉。
+     */
+    @Suppress("DEPRECATION")
     private fun setupWebView() {
         val wv = webView
         WebView.setWebContentsDebuggingEnabled(true)
@@ -616,8 +649,12 @@ class DshWebActivity : ComponentActivity() {
                 request: WebResourceRequest?,
                 error: WebResourceError?
             ) {
-                if (request?.isForMainFrame == true) {
-                    val msg = "主文档加载失败: ${request?.url} -> " +
+                // ⚠️ 必须写成 `request != null &&`，不能写成
+                // `request?.isForMainFrame == true`：后者是对 Boolean? 做相等比较，
+                // 编译器**不会**据此把 request 智能转换成非空，
+                // 于是下面用 `request.url` 会直接报「nullable receiver」。
+                if (request != null && request.isForMainFrame) {
+                    val msg = "主文档加载失败: ${request.url} -> " +
                         "${error?.errorCode} ${error?.description}"
                     Log.e(TAG, msg)
                     AppState.launcher.log("WEB $msg")
@@ -629,8 +666,9 @@ class DshWebActivity : ComponentActivity() {
                 request: WebResourceRequest?,
                 errorResponse: WebResourceResponse?
             ) {
-                if (request?.isForMainFrame == true) {
-                    val msg = "主文档 HTTP ${errorResponse?.statusCode}: ${request?.url}"
+                // 同上：显式判空才能拿到智能转换
+                if (request != null && request.isForMainFrame) {
+                    val msg = "主文档 HTTP ${errorResponse?.statusCode}: ${request.url}"
                     Log.e(TAG, msg)
                     AppState.launcher.log("WEB $msg")
                 }

@@ -235,8 +235,25 @@ class EngineTaskService : Service() {
         if (wifiLock?.isHeld != true) {
             runCatching {
                 val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                // HIGH_PERF：熄屏时也保持 Wi-Fi 全速，避免系统省电策略把下载限成涓流
-                val wf = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "fcl-dsh:engine-task")
+                // HIGH_PERF：熄屏时也保持 Wi-Fi 全速，避免系统省电策略把下载限成涓流。
+                //
+                // 它在 API 29 起有官方推荐的等价物：`WIFI_MODE_FULL_LOW_LATENCY`。
+                // 新常量语义更准（低延迟模式，专为前台长任务设计），
+                // 老系统上没有它，只能退回 HIGH_PERF —— 所以必须按版本分支。
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                // createWifiLock 在较新的 SDK 上被整体标记过时
+                //（Google 正在把「Wi-Fi 电源锁」归入 legacy 电源管理）。
+                // 目前没有等价替代：熄屏后不让 Wi-Fi 降速仍然只能靠它。
+                //
+                // ⚠️ 压制必须写成 `run { @Suppress(...) 调用 }`：判定只认
+                // 「注解直接贴住调用表达式」这一种位置，写在 val 行首、
+                // 语句上方或整个函数上都实测无效。
+                val wf = run { @Suppress("DEPRECATION") wm.createWifiLock(mode, "fcl-dsh:engine-task") }
                 wf.setReferenceCounted(false)
                 wf.acquire()
                 wifiLock = wf

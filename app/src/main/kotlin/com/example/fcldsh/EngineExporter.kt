@@ -240,12 +240,47 @@ object EngineExporter {
             val dataFiles = ArrayList<File>(dataAll.size)
             val skipped = ArrayList<String>(8)
             var skippedBytes = 0L
+            var skippedCount = 0
+            var keptPackageFiles = 0
             for (f in dataAll) {
                 val rel = relativeTo(dataDir, f)
-                if (isCredentialPath(rel)) {
+
+                // ── ① 硬规则：确定的密钥载体，**任何豁免都不给** ──────────────
+                //
+                // 这一层必须排在 node_modules / 代码扩展名豁免**之前**。
+                // 名字启发式抓不住真实的本应用密钥文件：
+                //   · `$DSH_HOME/.env`             —— AccountStore 写进去的 `*_API_KEY=sk-…`
+                //   · `$DSH_HOME/android-account.json` —— 全部账号（含每个 key 明文）
+                // `android-account` 不等于名单里的 `account`（是精确相等比较），
+                // `.env` 的扩展名也不在 CREDENTIAL_EXTENSIONS 里 —— 所以这两个
+                // 文件以前一直**原样进了包**，导入方拿到的是导出方的密钥。
+                if (isHardSecretPath(rel)) {
+                    skippedCount++
                     skippedBytes += f.length()
-                    if (skipped.size < 8) skipped.add(rel)
+                    if (skipped.size < MAX_SKIP_SAMPLES) skipped.add(rel)
                     continue
+                }
+
+                if (isCredentialPath(rel)) {
+                    // ★ 包源码里叫 cookies / auth / account 的模块不是凭据 ★
+                    //
+                    // dsh 的插件是 npm 包，装在 `profiles/<profile>/node_modules/`
+                    // 下面，也就是说**数据目录里混着大量第三方包的源码**。
+                    // 按名字过滤曾经把 `profiles/web/node_modules/undici/lib/web/cookies/`
+                    // 整个目录当成「登录状态」剔掉，导出/导入一个往返之后
+                    // undici 的 index.js 就 require 不到 `./lib/web/cookies`，
+                    // 表现为启用插件时报：
+                    //   Cannot find module './lib/web/cookies'
+                    //   require stack: .../profiles/web/node_modules/undici/index.js
+                    // 这类文件必须留在包里。
+                    if (isInsideNodeModules(rel) || hasCodeExtension(rel)) {
+                        keptPackageFiles++
+                    } else {
+                        skippedCount++
+                        skippedBytes += f.length()
+                        if (skipped.size < MAX_SKIP_SAMPLES) skipped.add(rel)
+                        continue
+                    }
                 }
                 dataFiles.add(f)
                 total += f.length()
@@ -255,10 +290,10 @@ object EngineExporter {
                 "📦 开始导出：引擎 ${files.size} 个文件、数据 ${dataFiles.size} 个文件，" +
                     "共 ${mb(total)} MB"
             )
-            if (skipped.isNotEmpty()) {
+            if (skippedCount > 0) {
                 DSHRunner.onLog(
-                    "🔒 已排除 ${skipped.size}${if (skipped.size >= 8) "+" else ""} 个登录状态文件" +
-                        "（${mb(skippedBytes)}）：${skipped.joinToString(", ")}"
+                    "🔒 已排除 $skippedCount 个登录状态文件（${mb(skippedBytes)}）：" +
+                        skipped.joinToString(", ") + if (skippedCount > skipped.size) " …" else ""
                 )
                 DSHRunner.onLog("ℹ️ 整合包不含登录凭据，导入后需要重新登录一次")
             } else if (dataFiles.isNotEmpty()) {
@@ -275,6 +310,12 @@ object EngineExporter {
                     ?: emptyList()
                 DSHRunner.onLog("🔎 未发现凭据类文件，数据目录顶层：${tops.joinToString(", ")}")
                 DSHRunner.onLog("   若上面有属于登录状态的文件，请告知以便补充排除名单")
+            }
+            if (keptPackageFiles > 0) {
+                DSHRunner.onLog(
+                    "📚 有 $keptPackageFiles 个名字像凭据但属于 npm 包/源码的文件已保留" +
+                        "（node_modules 与代码类扩展名一律进包）"
+                )
             }
 
             // 条目名前缀有两类，分别对应导入侧的两条落盘路径：
@@ -298,10 +339,15 @@ object EngineExporter {
             var done = 0L
             var lastPostAt = 0L
 
+            // 内容级抹除的统计。写在 writeAll 外面，因为局部函数只能捕获变量，
+            // 没法把自己的计数传回来 —— 用闭包累加最直接。
+            val scrubbed = ArrayList<String>(8)
+            var scrubbedCount = 0
+
             // 抽成局部函数：两批文件的写入逻辑完全一样，只有来源目录与前缀不同。
             // done / total / count / lastPostAt 由闭包共享，进度是连续的一条线，
             // 不会出现「引擎 100% 之后数据又从 0% 开始」的跳动。
-            fun writeAll(base: File, items: List<File>, prefix: String) {
+            fun writeAll(base: File, items: List<File>, prefix: String, redact: Boolean) {
                 for (f in items) {
                     if (cancelled) throw Cancelled()
 
@@ -314,32 +360,75 @@ object EngineExporter {
                         // 便于用哈希判断"两台机器上的引擎是否相同"。
                         time = FIXED_TIME
                     }
-                    zos.putNextEntry(entry)
-                    f.inputStream().use { input ->
-                        while (true) {
-                            if (cancelled) throw Cancelled()
-                            val read = input.read(buf)
-                            if (read <= 0) break
-                            zos.write(buf, 0, read)
-                            done += read
 
-                            val now = System.currentTimeMillis()
-                            if (now - lastPostAt > 250) {
-                                lastPostAt = now
-                                val p = if (total > 0) (done.toFloat() / total) else -1f
-                                val text = "${mb(done)} / ${mb(total)} MB"
-                                post { progress = p; message = text }
+                    // ── ② 内容级兜底：把残留的密钥值抹掉 ────────────────────
+                    //
+                    // 名字规则永远可能漏（dsh 换一版就可能改存储位置）。
+                    // 所以对**小体积文本配置**再做一次内容检查：
+                    // 命中 `sk-…` / `"apiKey": "…"` 这类形状就把值换成 REDACTED。
+                    //
+                    // 只扫配置类扩展名、只扫 node_modules 之外的、只扫 ≤256KB，
+                    // 三条限制让它成为一个便宜的后手：包内容（几十万文件）
+                    // 不参与，不会被拖慢，也不会被改坏。
+                    val patched: ByteArray? =
+                        if (redact && isRedactable(rel, f)) {
+                            redactSecrets(f) {
+                                scrubbedCount++
+                                if (scrubbed.size < MAX_SKIP_SAMPLES) scrubbed.add(rel)
+                            }
+                        } else null
+
+                    zos.putNextEntry(entry)
+                    if (patched != null) {
+                        zos.write(patched)
+                        done += patched.size.toLong()
+                    } else {
+                        f.inputStream().use { input ->
+                            while (true) {
+                                if (cancelled) throw Cancelled()
+                                val read = input.read(buf)
+                                if (read <= 0) break
+                                zos.write(buf, 0, read)
+                                done += read
+
+                                val now = System.currentTimeMillis()
+                                if (now - lastPostAt > 250) {
+                                    lastPostAt = now
+                                    val p = if (total > 0) (done.toFloat() / total) else -1f
+                                    val text = "${mb(done)} / ${mb(total)} MB"
+                                    post { progress = p; message = text }
+                                }
                             }
                         }
                     }
                     zos.closeEntry()
                     count++
+                    val now = System.currentTimeMillis()
+                    if (now - lastPostAt > 250) {
+                        lastPostAt = now
+                        val p = if (total > 0) (done.toFloat() / total) else -1f
+                        val text = "${mb(done)} / ${mb(total)} MB"
+                        post { progress = p; message = text }
+                    }
                 }
             }
 
-            writeAll(root, files, "node_modules/")
+            writeAll(root, files, "node_modules/", redact = false)
             if (dataFiles.isNotEmpty()) {
-                writeAll(dataDir, dataFiles, DSHRunner.DATA_PREFIX)
+                writeAll(dataDir, dataFiles, DSHRunner.DATA_PREFIX, redact = true)
+            }
+
+            if (scrubbedCount > 0) {
+                // 出现了内容级命中，说明有密钥藏在名字规则没覆盖到的文件里。
+                // 这里必须**明说**，因为这既是一次成功的拦截，也是一个信号：
+                // 名单该补了。只列前几个，其余用省略号带过。
+                DSHRunner.onLog(
+                    "🧽 已在 $scrubbedCount 个配置文件中抹掉疑似密钥" +
+                        "（改为 REDACTED）：${scrubbed.joinToString(", ")}" +
+                        if (scrubbedCount > scrubbed.size) " …" else ""
+                )
+            } else {
+                DSHRunner.onLog("🧽 内容复检：未在剩余配置文件中发现 `sk-…` / apiKey 形式的密钥")
             }
 
             zos.finish()
@@ -438,6 +527,52 @@ object EngineExporter {
             .trimStart(File.separatorChar)
             .replace(File.separatorChar, '/')
 
+    /** 日志里最多列几个被剔除的文件名（真实数量另记，见 skippedCount）。 */
+    private const val MAX_SKIP_SAMPLES = 8
+
+    /**
+     * 硬性排除的文件名（小写，比较的是**文件名**，不看目录）。
+     *
+     * ## 为什么单独一层
+     *
+     * [CREDENTIAL_NAMES] 是「名字像凭据就排除」的启发式，适用于猜 dsh 自己的
+     * 存储位置；而这里的几个文件是**本应用自己写的、位置确定的密钥载体**，
+     * 不能靠猜，也不能被 node_modules / 代码扩展名豁免放过：
+     *
+     * | 文件 | 内容 | 谁写的 |
+     * |---|---|---|
+     * | `.env` | `DEEPSEEK_API_KEY=sk-…` 等明文密钥 | [AccountStore] |
+     * | `android-account.json` | **全部**账号，每个都带 apiKey 明文 | [AccountStore] |
+     *
+     * 这两个文件以前一直原样进了包 —— `android-account` 不等于名单里的
+     * `account`（精确相等），`.env` 的扩展名也不在 CREDENTIAL_EXTENSIONS 里。
+     * 结果就是「导出方把密钥送给了导入方」。
+     */
+    private val HARD_SECRET_NAMES = setOf(
+        // 本应用写的密钥载体
+        ".env", "android-account.json",
+        // 凭据文件（版本库/ssh 那套约定）
+        ".netrc", ".git-credentials", ".npmrc", ".pypirc",
+        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"
+    )
+
+    /**
+     * 这个相对路径是否属于**确定**的密钥载体（[HARD_SECRET_NAMES]）。
+     *
+     * 只看最后一段（文件名），不看目录：目录叫 `.env` 不影响里面的代码。
+     * 另外覆盖 `.env` 的各种变体（`.env.local`、`prod.env`）—— dotenv 生态
+     * 的文件名就是这些，全都会装明文密钥。
+     */
+    private fun isHardSecretPath(rel: String): Boolean {
+        val name = rel.substringAfterLast('/').lowercase(Locale.ROOT)
+        if (name.isEmpty()) return false
+        if (name == ".env" || name.startsWith(".env.") || name.endsWith(".env")) return true
+        if (name in HARD_SECRET_NAMES) return true
+        // .npmrc / .yarnrc 系列（`registry` 行可能挂着 //host/:_authToken=）
+        if (name.startsWith(".npmrc") || name.startsWith(".yarnrc")) return true
+        return false
+    }
+
     /** 判断凭据名前要剥掉的扩展名。只剥配置类扩展，不碰目录名。 */
     private val CREDENTIAL_EXTENSIONS = listOf(
         ".json", ".jsonc", ".yml", ".yaml", ".toml", ".txt", ".db", ".sqlite", ".dat"
@@ -481,6 +616,11 @@ object EngineExporter {
      *
      * 逐段判断：任一路径段命中就算命中。这样 `auth/token.json`、
      * `plugins/foo/credentials.json`、`.credentials` 都能覆盖。
+     *
+     * ★ **调用方必须先排除 npm 包内容**（[isInsideNodeModules] /
+     * [hasCodeExtension]）。数据目录里装着 `profiles/<profile>/node_modules/`
+     * 这些第三方包，包里的 `lib/web/cookies/index.js`、`lib/auth.js`
+     * 这类**源码**只是名字像凭据，剔掉就会把插件依赖打成残废。
      */
     private fun isCredentialPath(rel: String): Boolean {
         for (segment in rel.split('/')) {
@@ -502,6 +642,106 @@ object EngineExporter {
         }
         return false
     }
+
+    // ------------------------------------------------------------------
+    // 内容级抹除（第二道防线）
+    // ------------------------------------------------------------------
+
+    /** 参与内容扫描的扩展名：能藏密钥的文本配置。代码与包清单不在内。 */
+    private val REDACT_EXTENSIONS = listOf(
+        ".env", ".yaml", ".yml", ".json", ".jsonl", ".toml", ".ini",
+        ".conf", ".properties", ".cfg", ".txt"
+    )
+
+    /** 单个文件扫描上限。超过这个体积的多半是会话正文，不是配置。 */
+    private const val REDACT_MAX_BYTES = 256L * 1024
+
+    /**
+     * 这个文件要不要做内容扫描。
+     *
+     * 三条限制，缺一不可：
+     *  1. **不在 `node_modules` 下** —— 那是几十万个包文件，扫一遍纯属浪费，
+     *     而且包里本来就没有别人的密钥；
+     *  2. 扩展名是配置类（[REDACT_EXTENSIONS]）—— 二进制/媒体文件读了也没意义；
+     *  3. 体积 1 字节…[REDACT_MAX_BYTES] —— 大文件是会话正文，不是配置。
+     */
+    private fun isRedactable(rel: String, f: File): Boolean {
+        if (isInsideNodeModules(rel)) return false
+        val name = rel.substringAfterLast('/').lowercase(Locale.ROOT)
+        if (REDACT_EXTENSIONS.none { name.endsWith(it) }) return false
+        return f.length() in 1..REDACT_MAX_BYTES
+    }
+
+    /** `sk-…` 形状的密钥（OpenAI / DeepSeek / 各类兼容网关都用这个前缀）。 */
+    private val PATTERN_SK_KEY = Regex("sk-[A-Za-z0-9_-]{16,}")
+
+    /**
+     * `"apiKey": "…"` / `TOKEN=…` 这类「键 + 值」形状。
+     *
+     * ## 为什么必须用引号反向引用
+     *
+     * 要**保留原来的引号**，否则 `{"apiKey":"sk-xxx"}` 会被改成
+     * `{"apiKey":"REDACTED` —— 少一个引号就成了坏 JSON，导入方读配置时
+     * 报解析错误，比密钥泄露还难查。所以用反向引用 `\2` 要求结尾引号
+     * 与开头一致；`.env` 那种没有引号的写法两边都匹配空串，同样成立。
+     *
+     * 值必须 ≥12 个字符：避免把 `"token": "auto"` 这种正常配置一起抹掉。
+     */
+    private val PATTERN_KEY_VALUE = Regex(
+        """(?i)("?(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|""" +
+            """access[_-]?token|auth[_-]?token|refresh[_-]?token|session[_-]?token|""" +
+            """api[_-]?secret|password|passwd|token)"?\s*[:=]\s*)("?)([A-Za-z0-9_.+\-]{12,})\2"""
+    )
+
+    /**
+     * 把文本里的密钥值换成 `REDACTED`，返回改写后的字节；
+     * **没命中返回 null**（调用方据此走原样拷贝，不做多余分配）。
+     *
+     * 命中时调用一次 [onHit]，统计与日志留给导出流程，本函数保持纯粹。
+     */
+    private fun redactSecrets(f: File, onHit: () -> Unit): ByteArray? {
+        val raw = runCatching { f.readText() }.getOrNull() ?: return null
+
+        var out = PATTERN_SK_KEY.replace(raw, "sk-REDACTED")
+        out = PATTERN_KEY_VALUE.replace(out) { m ->
+            val prefix = m.groupValues[1]
+            val quote = m.groupValues[2]
+            "$prefix${quote}REDACTED$quote"
+        }
+        if (out == raw) return null
+
+        onHit()
+        return out.toByteArray()
+    }
+
+    /**
+     * 这个相对路径是否落在某个 `node_modules` 之下（也就是 npm 包本体）。
+     *
+     * 插件的数据目录里几乎全是这类内容：`profiles/<profile>/node_modules/`，
+     * 里面是 undici、zod 这些包的真实源码。它们**不是**登录状态，
+     * 不能按文件名猜着剔掉（见 [isCredentialPath] 的说明）。
+     */
+    private fun isInsideNodeModules(rel: String): Boolean =
+        rel.split('/').any { it == "node_modules" }
+
+    /**
+     * 代码/资源类扩展名，命中即认为是包内容而非凭据。
+     *
+     * 与 [isInsideNodeModules] 互为兜底：有些插件不是按 npm 布局铺开的
+     * （直接把文件丢在插件目录里），照样会撞上 `cookies.js`、`auth.js`
+     * 这类名字。凭据是不会长成 `.js` 的。
+     */
+    private fun hasCodeExtension(rel: String): Boolean {
+        val name = rel.substringAfterLast('/').lowercase(Locale.ROOT)
+        return CODE_EXTENSIONS.any { name.endsWith(it) }
+    }
+
+    /** 一律视为「包内容、必须进包」的扩展名。 */
+    private val CODE_EXTENSIONS = listOf(
+        ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx",
+        ".map", ".json5", ".css", ".scss", ".html", ".hbs", ".wasm", ".node",
+        ".md", ".mdx", ".d.ts", ".snap", ".patch", ".sh", ".ps1", ".bin"
+    )
 
     /** 固定成 DOS 时间 1980-01-01，让重复导出产生字节一致的包。 */
     private const val FIXED_TIME = 315532800000L

@@ -78,27 +78,39 @@ object AccountStore {
      * 三种主流协议。
      *
      * @param defaultBase 默认 API 地址，用户可改（自建网关、中转站很常见）
-     * @param defaultModel 默认模型名，用户可改
+     * @param defaultModel 默认模型名，只在「拉不到模型列表」时当占位提示
+     * @param piApi 写进 `settings.yaml` 的 `api` 字段值。
+     *   **必须是 pi-ai 的 `KnownApi` 字面量**，写错了 dsh 会在解析配置阶段
+     *   就以「无法服务的路由」失败。三个值取自
+     *   `@earendil-works/pi-ai` 的 `dist/types.d.ts`：
+     *   ```ts
+     *   type KnownApi = "openai-completions" | ... | "anthropic-messages"
+     *                  | ... | "google-generative-ai" | ...
+     *   ```
      */
     enum class Protocol(
         val label: String,
         val defaultBase: String,
-        val defaultModel: String
+        val defaultModel: String,
+        val piApi: String
     ) {
         OPENAI(
             "OpenAI 兼容",
             "https://api.openai.com/v1",
-            "gpt-4o-mini"
+            "gpt-4o-mini",
+            "openai-completions"
         ),
         ANTHROPIC(
             "Anthropic",
             "https://api.anthropic.com",
-            "claude-3-5-haiku-20241022"
+            "claude-3-5-haiku-20241022",
+            "anthropic-messages"
         ),
         GEMINI(
             "Google Gemini",
             "https://generativelanguage.googleapis.com",
-            "gemini-1.5-flash"
+            "gemini-1.5-flash",
+            "google-generative-ai"
         );
 
         companion object {
@@ -118,7 +130,12 @@ object AccountStore {
      * @param protocol  第三方才有意义；官方固定按 OpenAI 兼容处理
      * @param baseUrl   API 地址
      * @param apiKey    密钥
-     * @param model     模型名
+     * @param model     模型名。第三方账号的模型由「拉取列表后选择」得来，
+     *                  不是用户手填的 —— 见 [discoverModels]。
+     * @param routeKey  注入 dsh 时用的**提供方路由键**（`settings.yaml` 里
+     *                  `llm-pi-ai.providers.<routeKey>` 的那个键）。必须遵守
+     *                  dsh 的命名规范：小写字母 / 数字 / 连字符。旧版本存下的
+     *                  账号没有这个字段，为空时由 [sanitizeRouteKey] 依名字现推。
      */
     data class Account(
         val id: String,
@@ -127,7 +144,8 @@ object AccountStore {
         val protocol: Protocol,
         val baseUrl: String,
         val apiKey: String,
-        val model: String
+        val model: String,
+        val routeKey: String = ""
     ) {
         /** 实际用的协议：官方固定 OpenAI 兼容。 */
         val effectiveProtocol: Protocol
@@ -140,6 +158,24 @@ object AccountStore {
         /** 实际用的模型：官方固定 deepseek-chat。 */
         val effectiveModel: String
             get() = if (kind == AccountKind.OFFICIAL) OFFICIAL_MODEL else model
+
+        /**
+         * 实际写入 dsh 的路由键。
+         *
+         * 官方账号不写 provider 配置（dsh 自带 `deepseek` 路由），这里返回
+         * 保留名只为让日志/UI 有个可显示的东西；[DshProviderConfig] 只处理
+         * 第三方账号。
+         */
+        val effectiveRouteKey: String
+            get() = if (kind == AccountKind.OFFICIAL) {
+                OFFICIAL_ROUTE
+            } else {
+                sanitizeRouteKey(routeKey.ifBlank { name })
+            }
+
+        /** 这条路由从哪个环境变量读密钥。 */
+        val apiKeyEnv: String
+            get() = apiKeyEnvFor(effectiveRouteKey)
 
         /** 列表里显示的一行副标题。 */
         val subtitle: String
@@ -160,6 +196,93 @@ object AccountStore {
     /** DeepSeek 官方端点与模型。 */
     const val OFFICIAL_BASE = "https://api.deepseek.com"
     const val OFFICIAL_MODEL = "deepseek-chat"
+
+    /** 官方账号对应的 dsh 内置路由键（我们**不**往 settings.yaml 里写它）。 */
+    const val OFFICIAL_ROUTE = "deepseek"
+
+    // ==============================================================
+    // 提供方路由键（dsh 的命名规范）
+    // ==============================================================
+
+    /**
+     * 路由键最大长度。
+     *
+     * dsh 会把它当提供方名显示在模型选择器里，太长会被截断；同时它还要
+     * 派生出环境变量名（大写 + 下划线），过长在 shell 里也不好读。
+     */
+    private const val ROUTE_KEY_MAX = 32
+
+    /**
+     * pi-ai 内置的提供方路由名。
+     *
+     * ★ 这些键**绝对不能**拿来当第三方路由 ★
+     *
+     * 在 `llm-pi-ai` 里，同名路由的 `models` 列表是**替换**内置 catalog，
+     * 不是扩充。用 `openai` 当路由键写一条 `models`，等于把用户原有的
+     * OpenAI 模型表整个顶掉 —— 正好违反「只添加，不覆盖已有模型」。
+     *
+     * 取自 `@earendil-works/pi-ai` 的 `KnownProvider`。
+     */
+    private val RESERVED_ROUTES = setOf(
+        "amazon-bedrock", "ant-ling", "anthropic", "google", "google-vertex",
+        "openai", "azure", "openai-codex", "radius", "typesafe", "nvidia",
+        "deepseek", "github-copilot", "xai", "groq", "cerebras", "openrouter",
+        "vercel-ai-gateway", "zai", "zai-coding-cn", "mistral", "minimax",
+        "minimax-cn", "moonshot", "moonshot-cn", "siliconflow", "together",
+        "fireworks", "deepinfra", "hyperbolic", "ollama", "lmstudio"
+    )
+
+    /**
+     * 把任意字符串收成合法的路由键。
+     *
+     * 规则（dsh / pi-ai 实际接受的范围）：小写字母、数字、连字符。
+     *  · 大写 → 小写
+     *  · 下划线、空格、点、其它分隔符 → 连字符
+     *  · 中文等非 ASCII 字符直接丢弃（YAML 键里能放，但派生成环境变量名会坏）
+     *  · 首字符不能是数字（否则 `123_API_KEY` 这种变量名多数读取方不认）
+     *  · 撞上 [RESERVED_ROUTES] 时加 `-gw` 后缀，避免顶掉内置 catalog
+     *
+     * 收敛后为空（比如名字全是中文）时返回 `"gw"`，调用方再靠去重避让。
+     */
+    fun sanitizeRouteKey(raw: String): String {
+        val sb = StringBuilder()
+        for (ch in raw.trim().lowercase()) {
+            when {
+                ch in 'a'..'z' || ch in '0'..'9' -> sb.append(ch)
+                // 这些一律视为分隔符，收成一个连字符
+                ch == '-' || ch == '_' || ch == '.' || ch == ' ' || ch == '\t' -> sb.append('-')
+                // 其它（含中文、标点）丢弃
+            }
+        }
+        var s = sb.toString()
+            .replace(Regex("-+"), "-")
+            .trim('-')
+        if (s.isEmpty()) s = "gw"
+        // 首字符必须是字母：数字开头派生出的环境变量名不合规
+        if (s.first() in '0'..'9') s = "gw-$s"
+        if (s.length > ROUTE_KEY_MAX) {
+            // 截断后可能留下尾部连字符，再修一次
+            s = s.take(ROUTE_KEY_MAX).trimEnd('-').ifEmpty { "gw" }
+        }
+        if (s in RESERVED_ROUTES) s = "$s-gw".take(ROUTE_KEY_MAX)
+        return s
+    }
+
+    /** 路由键是否合法（UI 用来决定「创建」按钮能不能点）。 */
+    fun isValidRouteKey(s: String): Boolean =
+        s.isNotEmpty() && s.length <= ROUTE_KEY_MAX &&
+            s.first() in 'a'..'z' && s.all { it in 'a'..'z' || it in '0'..'9' || it == '-' } &&
+            !s.endsWith("-") && !s.contains("--") && s !in RESERVED_ROUTES
+
+    /**
+     * 路由键 → 密钥环境变量名。
+     *
+     * `settings.yaml` 里只写**变量名**（`apiKeyEnv`），密钥本身仍走进程环境，
+     * 这样密钥不会落进配置文件。两边必须用同一个函数推导，否则 dsh 会以
+     * `MISSING_CREDENTIAL` 失败。
+     */
+    fun apiKeyEnvFor(routeKey: String): String =
+        sanitizeRouteKey(routeKey).uppercase().replace('-', '_') + "_API_KEY"
 
     /**
      * 「获取 key」跳转的地址：DeepSeek 开放平台的用量/密钥页。
@@ -215,7 +338,9 @@ object AccountStore {
                         protocol = Protocol.fromName(o.optString("protocol")),
                         baseUrl = o.optString("baseUrl"),
                         apiKey = o.optString("apiKey"),
-                        model = o.optString("model")
+                        model = o.optString("model"),
+                        // 旧文件没有 routeKey：留空，由 effectiveRouteKey 依名字现推
+                        routeKey = o.optString("routeKey")
                     )
                 )
             }
@@ -239,6 +364,7 @@ object AccountStore {
                         put("baseUrl", a.baseUrl)
                         put("apiKey", a.apiKey)
                         put("model", a.model)
+                        put("routeKey", a.routeKey)
                     }
                 )
             }
@@ -331,7 +457,7 @@ object AccountStore {
                 readTimeout = 25_000
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("User-Agent", "fcl-dsh/1.0 (Android)")
+                setRequestProperty("User-Agent", "fcl-dsh/${BuildConfig.VERSION_NAME} (Android)")
                 // 认证方式按协议分：这是三种协议唯一的硬差异
                 when (proto) {
                     Protocol.OPENAI -> setRequestProperty("Authorization", "Bearer $key")
@@ -368,6 +494,155 @@ object AccountStore {
         } finally {
             runCatching { conn?.disconnect() }
         }
+    }
+
+    // ==============================================================
+    // 拉取模型列表
+    // ==============================================================
+
+    /** 拉取模型列表的结果。 */
+    sealed class ModelListResult {
+        data class Ok(val models: List<String>) : ModelListResult()
+        data class Fail(val reason: String) : ModelListResult()
+    }
+
+    /**
+     * 问端点「你发布了哪些模型」。
+     *
+     * ## 为什么必须拉列表，而不是让用户手填模型名
+     *
+     * 第三方网关的模型名是**它自己的命名**（`qwen-max`、`deepseek-v3`、
+     * 带日期后缀的快照名……），用户照着别人截图手填几乎必然拼错；而 dsh
+     * 侧一旦模型名对不上，报的是 `UNKNOWN_MODEL`，用户根本看不出是拼写问题。
+     * 三级协议都有标准的列表端点，直接问比猜可靠。
+     *
+     * ## 三个端点
+     *
+     * | 协议 | 端点 | 认证 |
+     * |---|---|---|
+     * | OpenAI 兼容 | `GET {base}/models` | `Authorization: Bearer` |
+     * | Anthropic | `GET {base}/v1/models` | `x-api-key` + 版本头 |
+     * | Gemini | `GET {base}/v1beta/models` | `?key=` 查询参数 |
+     *
+     * **必须在后台线程调用**（内部发同步 HTTP 请求）。
+     */
+    fun discoverModels(account: Account): ModelListResult {
+        val proto = account.effectiveProtocol
+        val key = account.apiKey.trim()
+        // 去掉尾部斜杠；两个协议的路径里已经带 v1/v1beta，先剥掉免得拼成 /v1/v1
+        var base = account.effectiveBase.trim().trimEnd('/')
+        if (base.isBlank()) return ModelListResult.Fail("API 地址为空")
+        if (key.isBlank()) return ModelListResult.Fail("密钥为空")
+
+        val url = when (proto) {
+            Protocol.OPENAI -> "$base/models"
+            Protocol.ANTHROPIC -> {
+                if (base.endsWith("/v1")) base = base.dropLast(3)
+                "$base/v1/models"
+            }
+            Protocol.GEMINI -> {
+                if (base.endsWith("/v1beta")) base = base.dropLast(7)
+                "$base/v1beta/models?key=$key"
+            }
+        }
+
+        var conn: HttpURLConnection? = null
+        return try {
+            val c = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 15_000
+                readTimeout = 25_000
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "fcl-dsh/${BuildConfig.VERSION_NAME} (Android)")
+                when (proto) {
+                    Protocol.OPENAI -> setRequestProperty("Authorization", "Bearer $key")
+                    Protocol.ANTHROPIC -> {
+                        setRequestProperty("x-api-key", key)
+                        setRequestProperty("anthropic-version", "2023-06-01")
+                    }
+                    Protocol.GEMINI -> Unit
+                }
+            }
+            conn = c
+
+            val code = c.responseCode
+            if (code !in 200..299) {
+                val detail = runCatching {
+                    c.errorStream?.bufferedReader()?.use { it.readText() }
+                }.getOrNull().orEmpty().replace("\n", " ").take(120)
+                val reason = when (code) {
+                    401, 403 -> "密钥无效或没有权限（HTTP $code）"
+                    404 -> "地址不对，或该网关不支持模型列表端点（HTTP 404）"
+                    429 -> "请求过于频繁或额度用尽（HTTP 429）"
+                    else -> if (detail.isBlank()) "HTTP $code" else "HTTP $code · $detail"
+                }
+                return ModelListResult.Fail(reason)
+            }
+
+            val text = c.inputStream.bufferedReader().use { it.readText() }
+            val models = parseModelList(proto, text)
+            if (models.isEmpty()) {
+                ModelListResult.Fail("端点没有公布任何可用模型")
+            } else {
+                ModelListResult.Ok(models)
+            }
+        } catch (e: Exception) {
+            ModelListResult.Fail(e.message ?: e.javaClass.simpleName)
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
+    }
+
+    /**
+     * 解析列表响应。
+     *
+     * OpenAI / Anthropic 都是 `{"data":[{"id":…}]}`；Gemini 是
+     * `{"models":[{"name":"models/gemini-…"}]}`，名字要剥掉 `models/` 前缀。
+     * 顺带兼容个别网关直接返回顶层数组 `[{"id":…}]` 的情况。
+     */
+    private fun parseModelList(proto: Protocol, text: String): List<String> {
+        val out = LinkedHashSet<String>()
+
+        fun addId(raw: String?) {
+            val id = raw?.trim().orEmpty()
+            if (id.isNotEmpty() && id != "models/" && !out.contains(id)) out.add(id)
+        }
+
+        runCatching {
+            val trimmed = text.trim().removePrefix("\uFEFF")
+            if (trimmed.startsWith("[")) {
+                // 少数网关直接返回数组
+                val arr = JSONArray(trimmed)
+                for (i in 0 until arr.length()) {
+                    addId(arr.optJSONObject(i)?.optString("id"))
+                }
+            } else {
+                val o = JSONObject(trimmed)
+                if (proto == Protocol.GEMINI) {
+                    val arr = o.optJSONArray("models") ?: JSONArray()
+                    for (i in 0 until arr.length()) {
+                        val m = arr.optJSONObject(i) ?: continue
+                        // 只保留能对话的模型：embedding / 图像生成之类列进来也选不了
+                        val methods = m.optJSONArray("supportedGenerationMethods")
+                        if (methods != null) {
+                            var chat = false
+                            for (j in 0 until methods.length()) {
+                                if (methods.optString(j) == "generateContent") chat = true
+                            }
+                            if (!chat) continue
+                        }
+                        addId(m.optString("name").removePrefix("models/"))
+                    }
+                } else {
+                    val arr = o.optJSONArray("data") ?: JSONArray()
+                    for (i in 0 until arr.length()) {
+                        addId(arr.optJSONObject(i)?.optString("id"))
+                    }
+                }
+            }
+        }
+
+        return out.sorted()
     }
 
     // ==============================================================
@@ -472,6 +747,15 @@ object AccountStore {
                 candidates["GEMINI_API_KEY"] = key
                 candidates["GOOGLE_API_KEY"] = key
             }
+        }
+
+        // ── 第三方账号：再补一个**路由专属**变量 ────────────────────────
+        //
+        // settings.yaml 里写的 apiKeyEnv 就是这个变量名。dsh 按路由解析凭据，
+        // 不复用上面那些通用名 —— 通用名会串味：把中转站的 key 塞进
+        // OPENAI_API_KEY，dsh 内置的 openai 路由会拿它去连 api.openai.com。
+        if (account.kind == AccountKind.THIRD_PARTY) {
+            candidates[account.apiKeyEnv] = key
         }
 
         // 已有值的一律跳过：不覆盖 dsh 自己的配置

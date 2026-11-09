@@ -386,7 +386,7 @@ private fun downloadAsync(
                 connectTimeout = 15_000
                 readTimeout = 30_000
                 instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "fcl-dsh/1.0 (Android)")
+                setRequestProperty("User-Agent", "fcl-dsh/${BuildConfig.VERSION_NAME} (Android)")
             }
             conn = c
 

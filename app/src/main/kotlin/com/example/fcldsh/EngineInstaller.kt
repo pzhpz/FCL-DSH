@@ -88,7 +88,7 @@ object EngineInstaller {
                     connectTimeout = 15_000
                     readTimeout = 20_000
                     instanceFollowRedirects = true
-                    setRequestProperty("User-Agent", "fcl-dsh/1.0 (Android)")
+                    setRequestProperty("User-Agent", "fcl-dsh/${BuildConfig.VERSION_NAME} (Android)")
                     setRequestProperty("Accept", "application/json")
                 }
                 conn = c
@@ -526,7 +526,7 @@ object EngineInstaller {
             connectTimeout = 20_000
             readTimeout = 40_000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "fcl-dsh/1.0 (Android)")
+            setRequestProperty("User-Agent", "fcl-dsh/${BuildConfig.VERSION_NAME} (Android)")
         }
         val code = conn.responseCode
         if (code !in 200..299) {
@@ -552,7 +552,7 @@ object EngineInstaller {
         // npm 对 Node 主版本有硬要求（新版本 npm 常要求 >= 22），
         // 版本不符时 npm 会直接拒绝启动，没有这行日志很难判断。
         val nodeVer = probeNodeVersion(context, usr, nodePath)
-        DSHRunner.onLog("node 版本: ${nodeVer ?: "未知（--version 未能返回）"}")
+        DSHRunner.onLog("node 版本: ${nodeVer ?: "未知（自检未能返回）"}")
 
         // 容器里可能本来就没有 npm（实测只有 corepack），
         // 这里会自动从 registry 补装一份纯 JS 的 npm。
@@ -705,6 +705,13 @@ object EngineInstaller {
         // 安装阶段（npm 解析依赖、跑 lifecycle）同样需要看到容器自带的包，
         // 否则装出来的依赖树会和运行期实际能解析到的对不上。
         env["NODE_PATH"] = File(usr, "lib/node_modules").absolutePath
+        // OpenSSL 配置入口：与启动期完全一致。
+        //
+        // 必须在**安装期**也设上：npm 走 HTTPS 拉 tarball，正是最依赖 TLS 的
+        // 一步。若这里仍旧让 OpenSSL 去读 Termux 那个不可达的路径，
+        // 表现就是「node --version 正常、npm 一联网就挂」—— 而这恰恰是
+        // 最容易被误判成「网络问题」的一种失败。
+        env.putAll(OpenSslEnv.ensure(usr.absolutePath, DSHRunner.onLog))
         // 关掉 npm 自身的更新检查，省掉一次网络往返
         env["npm_config_update_notifier"] = "false"
         env["npm_config_fund"] = "false"
@@ -1041,17 +1048,43 @@ object EngineInstaller {
     }
 
     /**
-     * 执行 `node --version`，确认容器里的 node 真能跑。
+     * 跑一次**真正会初始化 OpenSSL** 的 node 自检，确认容器里的 node 能跑，
+     * 顺带把版本号读出来（npm 对 Node 主版本有硬要求，新版 npm 常要求 >= 22）。
      *
-     * npm 对 Node 主版本有硬要求（新版 npm 常要求 >= 22）。版本不符时
-     * npm 会直接拒绝启动且输出很短，没有这行日志很难判断是版本问题
-     * 还是网络/依赖问题。
+     * ## ★ 为什么不能再是 `node --version` ★
+     *
+     * `--version` 在 Node 启动的最早期分支里就打印版本号退出了：
+     * **不加载 OpenSSL 配置，不碰 crypto**。于是它在一个已经坏掉的容器里
+     * 也能返回一份漂亮的版本号 —— 实测日志正是这样：
+     *
+     * ```
+     * node 版本: v24.18.0            ← 通过
+     * npm --version 退出码 13        ← 紧接着就挂
+     * fopen(/data/data/com.termux/files/usr/etc/tls/openssl.cnf, rb) Permission denied
+     * ```
+     *
+     * 把它当健康检查等于把故障推迟到 npm 那一层才暴露，还顺带把结论带偏
+     *（看到「node 是好的」，自然会去怀疑网络）。
+     *
+     * 现在改成 `-e`：先打印版本号，再 `createHash('sha256')` 真正初始化一次
+     * crypto/OpenSSL。环境不对时这里当场就挂，不用等 npm。
      */
     private fun probeNodeVersion(context: Context, usr: File, nodePath: File): String? {
+        // 第一行给调用方当日志用，第二行是 crypto 自检结果。
+        // 用 require('node:crypto') 而不是裸 'crypto'：前者不会被同名目录遮蔽。
+        val script = "process.stdout.write('v' + process.versions.node + '\\n');" +
+            "require('node:crypto').createHash('sha256').update('fcl').digest('hex');" +
+            "process.stdout.write('crypto=ok\\n')"
         return runCatching {
-            val pb = ProcessBuilder("/system/bin/linker64", nodePath.absolutePath, "--version")
+            val pb = ProcessBuilder(
+                "/system/bin/linker64",
+                nodePath.absolutePath,
+                "-e",
+                script
+            )
             pb.redirectErrorStream(true)
             pb.environment().apply {
+                put("PREFIX", usr.absolutePath)
                 put("LD_LIBRARY_PATH", File(usr, "lib").absolutePath)
                 // 与正式安装保持一致的 HOME：两处都走实例 HOME，
                 // 否则预检看到的 npm 缓存/配置与真正安装时不是同一份，
@@ -1059,14 +1092,26 @@ object EngineInstaller {
                 put("HOME", DSHRunner.instanceHome(context).absolutePath)
                 put("TMPDIR", File(context.cacheDir, "tmp").apply { mkdirs() }.absolutePath)
                 put("PATH", "${File(usr, "bin").absolutePath}:/system/bin")
+                // 与 npm 预检/正式安装同一份 OpenSSL 配置。
+                // 少了这一行，自检本身就是「另一个环境」，测出来的结论不可信。
+                putAll(OpenSslEnv.ensure(usr.absolutePath, DSHRunner.onLog))
             }
             val p = pb.start()
             val out = p.inputStream.bufferedReader().readText().trim()
             val code = p.waitFor()
+            val lines = out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
             if (code == 0) {
-                out.ifBlank { null }
+                if (lines.size >= 2) {
+                    DSHRunner.onLog("🔐 node crypto 自检通过（OpenSSL 初始化正常）")
+                }
+                lines.firstOrNull()?.takeIf { it.startsWith("v") }
             } else {
-                DSHRunner.onLog("node --version 退出码 $code: ${out.take(200)}")
+                DSHRunner.onLog("node 自检退出码 $code: ${out.take(300)}")
+                // 退出码 13 是这类故障的固定特征：OpenSSL 读不到配置时
+                // 进程以 13 结束。直接把根因和本机路径打出来，省掉一轮猜测。
+                val conf = File(usr, "etc/tls/openssl.cnf")
+                DSHRunner.onLog("   ★ 根因：OpenSSL 读不到配置（容器里的 libssl 编译期写死了 Termux 路径）")
+                DSHRunner.onLog("     本机配置: ${conf.absolutePath}（存在=${conf.isFile}）")
                 null
             }
         }.onFailure {
@@ -1117,6 +1162,9 @@ object EngineInstaller {
                 put("npm_config_yes", "true")
                 put("CI", "1")
                 put("TERM", "dumb")
+                // 与正式安装保持同一份 OpenSSL 配置：预检若在 TLS 初始化上
+                // 就走不同的路，结论会失真（预检「起不来」而实际是环境差异）。
+                putAll(OpenSslEnv.ensure(usr.absolutePath, DSHRunner.onLog))
             }
 
             val p = pb.start()
@@ -1154,6 +1202,15 @@ object EngineInstaller {
             } else {
                 DSHRunner.onLog("$pmName --version 退出码 $code")
                 if (text.isNotBlank()) DSHRunner.onLog("   输出: ${text.take(300)}")
+                // 预检失败最容易误判成「npm 版本不对」。这里把最常见的那个
+                // 根因直接点名：容器里的 libssl 编译期把 OPENSSLDIR 写死成
+                // Termux 的私有目录，装了 Termux 的设备上读它会 EACCES，
+                // 进程以退出码 13 结束 —— 与 npm 自身的版本毫无关系。
+                if (text.contains("OpenSSL configuration error")) {
+                    val conf = File(usr, "etc/tls/openssl.cnf")
+                    DSHRunner.onLog("   ★ 根因：OpenSSL 读不到配置（编译期写死 Termux 路径）")
+                    DSHRunner.onLog("     本机配置: ${conf.absolutePath}（存在=${conf.isFile}）")
+                }
                 null
             }
         }.onFailure {

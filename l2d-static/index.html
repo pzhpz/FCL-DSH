@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <title>Live2D</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+    #stage { display: block; width: 100vw; height: 100vh; touch-action: none; }
+    #hint {
+      position: fixed; inset: 0; display: none; place-items: center;
+      color: #8b93a7; font: 14px/1.6 -apple-system, "PingFang SC", sans-serif;
+      text-align: center; padding: 24px; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <div id="hint"></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

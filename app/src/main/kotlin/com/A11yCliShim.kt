@@ -52,6 +52,15 @@ internal fun ensureA11yCli(prefix: String): Boolean {
         # fcl-shim a11y
         # 手机能力桥接的命令行入口。鉴权在 a11y-cli.mjs 内部完成，
         # agent 不需要读取 token，也不需要自己拼 curl。
+        #
+        # OpenSSL 配置：本命令通常由引擎进程 spawn，环境变量会继承；但它也可能
+        # 被用户/agent 在别的 shell 里直接调用，那时 OPENSSL_CONF 就没有了，
+        # 而容器里的 libssl 把 OPENSSLDIR 写死成 Termux 的私有目录，
+        # 一碰 crypto/https 就以退出码 13 结束。行成本很低，一并补上。
+        if [ -f "$prefix/etc/tls/openssl.cnf" ]; then
+            OPENSSL_CONF="$prefix/etc/tls/openssl.cnf"
+            export OPENSSL_CONF
+        fi
         exec /system/bin/linker64 "$prefix/bin/node" "$prefix/lib/$A11Y_CLI_FILE" "${'$'}@"
     """.trimIndent() + "\n"
 

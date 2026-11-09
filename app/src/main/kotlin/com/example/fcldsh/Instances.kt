@@ -53,11 +53,17 @@ object Instances {
     /** 引擎入口文件（相对版本目录）。存在且非空才算装好。 */
     private const val ENGINE_MARKER = "node_modules/@deepseek-ai/dsh/lib/bin.js"
 
-    /** 安装中的暂存目录（不是可用版本，扫目录时必须跳过）。 */
-    private const val INCOMING = "__incoming__"
+    /**
+     * 安装中的暂存目录（不是可用版本，扫目录时必须跳过）。
+     *
+     * 对外可见是因为 [Storage.clearResidue] 要清它的残留 —— 失败/取消的安装
+     * 会在版本根下留一整棵 `node_modules`，它不属于任何实例，
+     * 「删除实例」时顺手收掉才不会越攒越多。
+     */
+    const val INCOMING = "__incoming__"
 
     /** 导入整合包时数据目录的暂存目录（同样不是可用版本）。 */
-    private const val INCOMING_DATA = "__incoming_data__"
+    const val INCOMING_DATA = "__incoming_data__"
 
     /** 后缀从 2 开始：`-1` 看起来像版本号的一部分，容易误读。 */
     private const val SUFFIX_FROM = 2
@@ -233,12 +239,26 @@ object Instances {
         var done = 0
         fun remove(d: File) {
             if (!d.exists()) return
-            val kids = runCatching { d.listFiles() }.getOrNull() ?: return
-            for (f in kids) {
-                if (f.isDirectory) remove(f)
-                runCatching { f.delete() }
+            // ★ 软链只删链接本身 ★
+            //
+            // `attachments` 是外置的软链（见 AttachmentsStorage.kt）。对链接做
+            // 递归会顺着走到外部目录里，把那边的文件一起删掉 —— 本项目在
+            // 插件/工作区上各踩过一次，这里必须先拦。外部那份由
+            // removeAttachmentsForVersion() 按版本精确清理。
+            if (com.isLink(d)) {
+                runCatching { d.delete() }
                 done++
                 if (total > 0) onProgress((done.toFloat() / total).coerceIn(0f, 1f))
+                return
+            }
+            val kids = runCatching { d.listFiles() }.getOrNull() ?: return
+            for (f in kids) {
+                if (f.isDirectory && !com.isLink(f)) remove(f)
+                else {
+                    runCatching { f.delete() }
+                    done++
+                    if (total > 0) onProgress((done.toFloat() / total).coerceIn(0f, 1f))
+                }
             }
             runCatching { d.delete() }
         }
@@ -252,8 +272,20 @@ object Instances {
         // 删的是当前使用的那份时清掉指针
         clearPointerIfActive(context, id)
 
+        // ── 彻底卸载：把「不属于任何实例」的残留一起收掉 ──────────────────
+        //
+        // 上面两棵树删完，磁盘上往往还剩两三百 MB 甚至上 G：
+        //   · `usr/lib/versions/__incoming__*` —— 失败/取消的安装留下的整棵 node_modules
+        //   · `home/.npm` —— npm 缓存，跨安装复用，装过几个版本就上 G
+        // 前者任何时候都能删；后者只在「一个实例都不剩」时才删（见 purgeSharedCaches
+        // 的注释：留着能让下次安装快几十秒）。用户点的是「卸载」，
+        // 不该留下一堆没人会再读的东西。
+        onProgress(1f)
+        runCatching { Storage.clearResidue(context) }
+        runCatching { Storage.purgeSharedCaches(context) }
+
         val ok = !engine.exists() && !data.exists()
-        if (ok) Log.i(TAG, "已删除部署 $id")
+        if (ok) Log.i(TAG, "已删除部署 $id（含缓存与安装残留）")
         else Log.w(TAG, "删除部署 $id 未完全成功，可能有文件被占用")
         return ok || (!engine.exists() && !data.exists())
     }

@@ -484,6 +484,144 @@ private fun DshSettingsTab(
         path = DSHRunner.workspaceDir(context).absolutePath,
         shape = RowShape.SINGLE
     )
+
+    // ── 存储 ────────────────────────────────────────────────────────
+    Spacer(modifier = Modifier.height(6.dp))
+    StorageSection(state = state)
+}
+
+/**
+ * 「存储」一节：三行占用 + 一个一键清理。
+ *
+ * ## 为什么只有这么几行
+ *
+ * 磁盘上能吃掉空间的地方有七处（容器、各版本引擎、`$DSH_HOME`、工作区、
+ * npm 缓存、安装临时文件、下载的包），逐项列出来会变成一张报表，
+ * 而用户真正要的是「看出大头在哪、一键收掉」。所以按**处置方式**合并成三组：
+ *
+ * | 行 | 内容 | 能不能清 |
+ * |---|---|---|
+ * | 引擎与实例 | `usr/` + `home/`（会话、工作区、凭据） | 只能删实例，见上面那行 |
+ * | 缓存与临时文件 | `home/.npm`、`home/.cache`、`cacheDir/` | 可清 |
+ * | 下载文件 | 外部下载目录里的 `.tgz` | 可清 |
+ *
+ * ## 为什么要单独把缓存列出来
+ *
+ * npm 的 `_cacache` 是**跨安装复用**的：装一个引擎落几百 MB，装几个版本就上 G，
+ * 而「删除该版本」按设计只删实例自己的两棵树，缓存一分不动 ——
+ * 这正是「装完 400MB、删干净实例却剩 1.4G」的差额来源。
+ * 现在删最后一个实例时会顺带收掉它（[Storage.purgeSharedCaches]），
+ * 这个面板负责让用户随时手动收，也能看见到底占了多大。
+ *
+ * ## 实例正在运行时不清 `cacheDir/tmp`
+ *
+ * 那是引擎进程的 `TMPDIR`（见 [DSHRunner.startNode]），删掉会让运行中的
+ * 进程写临时文件失败。其余缓存照清 —— 它们只被「安装」读，不被「运行」读。
+ */
+@Composable
+private fun StorageSection(state: LauncherState) {
+    val context = LocalContext.current
+    val main = remember { Handler(Looper.getMainLooper()) }
+
+    var usage by remember { mutableStateOf<StorageUsage?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var freed by remember { mutableStateOf<Long?>(null) }
+    // 清理完 tick++ 触发重量：Compose 里没有「重新执行一次测量」的按钮，
+    // 用 key 变化是最省事的做法。
+    var tick by remember { mutableStateOf(0) }
+
+    // 统计要遍历引擎那上万个小文件，绝不能放主线程 —— 那会让面板卡住好几秒。
+    LaunchedEffect(tick) {
+        usage = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            Storage.measure(context)
+        }
+    }
+
+    val installing = EngineInstaller.isBusy() || DshEngineDownloader.isBusy()
+    val canClear = !busy && !installing
+    val total = usage?.total ?: 0L
+    val reclaimable = usage?.reclaimable ?: 0L
+
+    FclSettingSection("存储")
+
+    FclSettingRow(
+        label = "引擎与实例",
+        description = "容器、各版本引擎，以及实例里的会话、工作区与凭据。" +
+            "这一块只能靠上面的「删除该版本」释放。",
+        shape = RowShape.TOP
+    ) {
+        HScrollSize(usage?.engine)
+    }
+
+    FclSettingRow(
+        label = "缓存与临时文件",
+        description = "npm 下载缓存与安装临时文件。清掉不影响已装好的实例，" +
+            "只是下次安装要重新下载。",
+        shape = RowShape.MIDDLE
+    ) {
+        HScrollSize(usage?.cache)
+    }
+
+    FclSettingRow(
+        label = "下载文件",
+        description = "下载中心保存的包文件（应用外部下载目录）。",
+        shape = RowShape.BOTTOM
+    ) {
+        HScrollSize(usage?.download)
+    }
+
+    // 一键清理
+    FclSettingRow(
+        label = "一键清理",
+        description = when {
+            busy -> "正在清理…"
+            installing -> "安装/下载进行中，结束再清理。"
+            usage == null -> "正在统计占用…"
+            else -> "当前共 ${fmtSize(total)}，可释放 ${fmtSize(reclaimable)}。" +
+                (freed?.let { " 上次释放 ${fmtSize(it)}。" } ?: "")
+        },
+        shape = RowShape.SINGLE
+    ) {
+        Surface(
+            shape = RoundedCornerShape(6.dp),
+            color = if (canClear) Fcl.Theme else Fcl.TextTertiary,
+            modifier = if (canClear) {
+                Modifier.fclClickable {
+                    busy = true
+                    freed = null
+                    // 清理是纯磁盘操作（上万个文件），放后台线程；
+                    // 结果回主线程再改 Compose 状态。
+                    Thread {
+                        val got = Storage.clearAll(context, keepTmp = state.runState.isAlive)
+                        main.post {
+                            busy = false
+                            freed = got
+                            tick++
+                        }
+                    }.start()
+                }
+            } else {
+                Modifier
+            }
+        ) {
+            Text(
+                text = if (busy) "清理中" else "清理",
+                color = Color.White,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
+            )
+        }
+    }
+}
+
+/** 右侧的尺寸文案；还没统计完时显示 `…`，不假装是 0。 */
+@Composable
+private fun HScrollSize(bytes: Long?) {
+    Text(
+        text = bytes?.let { fmtSize(it) } ?: "…",
+        color = Fcl.TextSecondary,
+        fontSize = 11.sp
+    )
 }
 
 /**

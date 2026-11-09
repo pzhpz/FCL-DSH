@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.DSHRunner
+import com.example.fcldsh.R
 
 /**
  * 侧栏面板进出场动画时长（毫秒）。
@@ -82,6 +83,21 @@ private val PanelEasing = androidx.compose.animation.core.FastOutSlowInEasing
  */
 private val REAL_PANELS: List<LauncherPanel> =
     LauncherPanel.values().filter { it != LauncherPanel.NONE }
+
+/**
+ * 「运行模式」页里那条可行动指引的四个字段。
+ *
+ * 抽成数据类而不是在 when 分支里直接拼 UI：分支只负责给出**内容**，
+ * 是否需要点击、右侧显示什么由下面统一决定 —— 否则四条分支各写一遍
+ * `FclSettingRow`，改文案时很容易漏改其中一条。
+ */
+private data class PrivGuide(
+    val label: String,
+    val desc: String,
+    val action: String,
+    /** true 表示这一行能点（只有「服务在跑但未授权」才成立）。 */
+    val actionable: Boolean
+)
 
 /**
  * 启动器主界面（仿 FCL 布局）。
@@ -157,6 +173,15 @@ class MainActivity : ComponentActivity() {
     private var pendingLocalZip by mutableStateOf<Uri?>(null)
 
     /**
+     * 刚选中的压缩包文件名（不含扩展名），用作命名窗的默认值。
+     *
+     * 用户在文件管理器里挑出来的包通常已经叫了有意义的名字
+     * （`我的整合包.zip`），直接拿来当默认显示名比让他重打一遍合理。
+     * 读不到就留空，调用方回落到「本地引擎包」。
+     */
+    private var pendingLocalZipName by mutableStateOf<String?>(null)
+
+    /**
      * 从本地选一个引擎 zip 安装。
      *
      * 给「没有稳定下载地址」的情况留退路：把引擎包放进手机存储，
@@ -169,6 +194,16 @@ class MainActivity : ComponentActivity() {
                 ui.log("❌ 未选择引擎包")
                 return@registerForActivityResult
             }
+            // 取一下文件名当默认显示名。读不到不算错误 —— 命名窗会给
+            // 「本地引擎包」作为兜底默认值，用户仍可自己改。
+            pendingLocalZipName = runCatching {
+                contentResolver.query(
+                    uri,
+                    arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                    null, null, null
+                )?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            }.getOrNull()
+
             // 先只记下选择，交给命名窗；安装要等用户确认名字之后
             pendingLocalZip = uri
         }
@@ -709,6 +744,28 @@ class MainActivity : ComponentActivity() {
         // 端口与 token 写在 ~/a11y-bridge.json，agent 直接 cat 就能拿到。
         A11yBridgeServer.start(this)
 
+        // ★ 启动时就检查 Shizuku 授权 ★
+        //
+        // 进设置页时状态应当已经准了，而不是进去之后再慢慢修正（那会看到
+        // 「先可点、一秒后变灰」的抖动）。同时这里也把 Shizuku 的状态监听挂上，
+        // binder 稍后才就绪的时序也能覆盖。
+        //
+        // 放后台线程：里面有 binder 调用与一次 PackageManager 查询，
+        // 不该占主线程；失败无副作用（只是 Shizuku 模式变灰）。
+        Thread { Privilege.startupCheck(applicationContext) }
+            .apply { isDaemon = true; name = "dsh-priv-startup" }
+            .start()
+
+        // ★ 让 Shizuku 通道与「服务何时启动」解耦 ★
+        //
+        // 原先 `shz` 只在引擎启动时生成一次，于是存在一个很难自己发现的顺序陷阱：
+        // 先重启引擎、后启动 Shizuku → 启动那一刻连不上 → 永远没有 `shz`，
+        // 必须再重启一次引擎才行。
+        //
+        // 这里挂上状态监听：绑定器一上线、授权一到，只要引擎在跑就立刻建桥
+        // 并把 `shz` 落盘；服务掉线时反向收掉。用户不需要关心操作顺序。
+        ShizukuBridge.watchState(this)
+
         // 生成/更新 Node 侧的 fs 补丁（硬链接降级 + 祖先目录 open 容错）。
         //
         // 必须赶在 dsh 启动之前写好：DSHRunner.startNode 会 `--import` 这个文件。
@@ -1139,6 +1196,39 @@ class MainActivity : ComponentActivity() {
                 .fillMaxSize()
                 .fclBackground()
         ) {
+            // 右侧菜单宽度（屏宽 25%，夹到 [150dp, 260dp]）。
+            // 必须**先**算出来：下面的 L2D 面板要用它让位。
+            val panelWidth = rightMenuWidth()
+
+            // ── 透明 Live2D 面板（assets/l2d 那个静态前端）────────────────
+            //
+            // 位置：**贴右下**，紧挨右侧菜单左边缘，不压任何按钮（不增改按键）。
+            //   - `Alignment.BottomEnd` + `end` 内边距 = 右边缘对齐菜单，
+            //     所以模型是靠到右边而不是横跨整屏（原来是 BottomStart + 满宽，
+            //     面板虽然让出了菜单，但自身仍占满左侧一整条）。
+            //   - 只设 `end` 不设 `start`：宽度由 fillMaxWidth 的比例决定，
+            //     左边自然空出来。
+            //
+            // 尺寸：相对原来缩到 2/3（即缩小三分之一）。
+            //   宽和高**同比例**缩，否则容器宽高比变了，Live2D 的 canvas 会
+            //   按新比例重新适配，模型看起来被压扁或拉长。
+            //   高度基准 0.92 是原来的值（模型脚踩底、头顶留一截避开状态栏），
+            //   乘同一个 2/3 保持相对位置关系不变。
+            //
+            // 为什么放在这里（Box 的第一个子项）：Compose 里 AndroidView 是
+            // **真子 View**，绘制顺序在 Compose 画布之上，所以它一定盖在
+            // 背景渐变上（这正是透明面板想要的），但也会盖住侧栏面板 ——
+            // 因此面板展开时用 `visible = false` 收起来（见 L2DPanel 的说明）。
+            val l2dScale = 2f / 3f
+            L2DPanel(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = panelWidth + 8.dp)
+                    .fillMaxWidth(l2dScale)
+                    .fillMaxHeight(0.92f * l2dScale),
+                visible = state.panel == LauncherPanel.NONE
+            )
+
             // 右侧菜单：对应 FCL activity_main.xml 的 @id/right_menu
             //   background="@drawable/bg_right_menu"  → 半透明白 + 只圆左侧两角
             //   layout_constraintWidth_percent="0.25" → 屏宽的 1/4
@@ -1147,7 +1237,6 @@ class MainActivity : ComponentActivity() {
             // 之后再夹到 [150dp, 260dp]：平板/横屏得到 25% 的观感，竖屏也不会崩。
             // 与 PanelHost 共用同一个宽度：两处各算各的会让面板盖住右栏
             // 或者平白空出一截。
-            val panelWidth = rightMenuWidth()
             Box(
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
@@ -1794,6 +1883,12 @@ class MainActivity : ComponentActivity() {
         val activeId = remember(tick) { Instances.activeId(context) }
         val activeInstance = instances.firstOrNull { it.id == activeId }
 
+        // 正在改名的版本键（null = 没有在改名）。
+        //
+        // 改名只是写一个**显示标签**（VersionLabels），不动目录名、
+        // 不动 DSH_HOME、不动指针 —— 所以不需要重启实例，也不需要碰磁盘。
+        var renamingKey by remember { mutableStateOf<String?>(null) }
+
         // 升级前的老部署没有实例，数据仍在 filesDir/home 与 filesDir/usr 下。
         // 那种情况回落到按版本列出，否则面板会一片空白、用户以为数据丢了。
         val legacyVersions = remember(tick) {
@@ -1814,7 +1909,8 @@ class MainActivity : ComponentActivity() {
             instances.map { inst ->
                 VersionPickRow(
                     key = inst.id,
-                    title = inst.name,
+                    // 标题走标签：没设过就回落到版本键本身，所以老用户看不出区别。
+                    title = VersionLabels.displayName(context, inst.id),
                     subtitle = buildString {
                         // 只写出真实存在的版本号；不再显示「未装引擎」这类提示。
                         if (inst.version.isNotBlank()) append("引擎 ${inst.version}")
@@ -1850,7 +1946,7 @@ class MainActivity : ComponentActivity() {
             legacyVersions.map { v ->
                 VersionPickRow(
                     key = v,
-                    title = v,
+                    title = VersionLabels.displayName(context, v),
                     subtitle = if (v == current) "当前使用中" else "旧版单实例布局 · 点此切换",
                     isCurrent = v == current,
                     mono = true,
@@ -1919,16 +2015,24 @@ class MainActivity : ComponentActivity() {
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Column(modifier = Modifier.weight(1f)) {
+                            // 显示名统一走 VersionLabels：设过标签用标签，
+                            // 没设过回落到版本键本身（老用户看不出任何区别）。
+                            //
+                            // 早先这里写的是 `activeInstance?.name ?: current` ——
+                            // 而 `Instance.name` 恒等于目录名（见 Instances 的注释：
+                            // 那套「实例名」设计已废弃），所以两者本来就是同一个值，
+                            // 这个「回落」从来不会真的回落到 current。
+                            val shownKey = activeInstance?.id ?: current
+                            val shownLabel = shownKey?.let { VersionLabels.displayName(context, it) }
+                            val hasCustomLabel =
+                                shownKey != null && VersionLabels.label(context, shownKey) != null
                             Text(
-                                // 有实例时显示**实例名** —— 那是用户自己起的、认得出来的名字。
-                                // 没有实例的老部署才回落到版本号，此时版本号确实是它的标识。
-                                text = activeInstance?.name
-                                    ?: current
-                                    ?: "还没有实例",
+                                text = shownLabel ?: "还没有实例",
                                 color = if (installed) Fcl.TextPrimary else Fcl.TextSecondary,
                                 fontSize = 12.sp,
-                                // 实例名可能有中文，不套等宽字体；老部署的版本号仍然用等宽
-                                fontFamily = if (activeInstance != null) null
+                                // 标签可能是中文，中文不用等宽字体；
+                                // 显示的是原始版本键时仍然用等宽，方便辨认数字段。
+                                fontFamily = if (hasCustomLabel) null
                                 else FontFamily.Monospace
                             )
                             Text(
@@ -2027,6 +2131,17 @@ class MainActivity : ComponentActivity() {
                                             overflow = TextOverflow.Ellipsis
                                         )
                                     }
+                                    // 「改名」只改显示标签，不动目录名。
+                                    // 嵌套在整行点击里：内层会先消费事件，
+                                    // 所以点它不会连带触发切换。
+                                    Text(
+                                        text = "改名",
+                                        color = Fcl.ThemeText,
+                                        fontSize = 10.sp,
+                                        modifier = Modifier
+                                            .fclClickable { renamingKey = row.key }
+                                            .padding(start = 8.dp, top = 4.dp, bottom = 4.dp)
+                                    )
                                 }
 
                                 if (idx < rows.size - 1) {
@@ -2057,6 +2172,30 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+
+        // ── 改名小窗（独立于上面那个版本管理窗）─────────────────────────
+        //
+        // 只写一个**显示标签**（VersionLabels），不动目录名、不动 DSH_HOME、
+        // 不动指针，所以既不重启实例也不碰磁盘。改完 `tick++` 让列表重扫。
+        //
+        // 放在版本管理 Dialog **之后**而不是嵌在里面：两个都是 Dialog，
+        // 嵌套会让第二个的层级依赖平台实现，叠在上层不稳定。
+        val rk = renamingKey
+        if (rk != null) {
+            VersionLabelDialog(
+                title = "改个显示名",
+                hint = "版本 $rk。只改界面显示，不动版本目录与数据目录。",
+                // 没设过标签时默认填版本键本身 —— 用户看到的就是当前显示的内容
+                defaultName = VersionLabels.label(context, rk) ?: rk,
+                onDismiss = { renamingKey = null },
+                onConfirm = { label ->
+                    renamingKey = null
+                    // 空串 = 清除标签，退回显示版本键
+                    VersionLabels.set(context, rk, label.ifBlank { null })
+                    tick++
+                }
+            )
+        }
     }
 
     /**
@@ -2074,6 +2213,35 @@ class MainActivity : ComponentActivity() {
         val context = LocalContext.current
         var mode by remember { mutableStateOf(LauncherPrefs.getPermissionMode(context)) }
         var pendingDanger by remember { mutableStateOf<PermissionMode?>(null) }
+
+        // 运行权限（普通 / Shizuku / Root）—— 与上面的「沙箱权限」是两个正交的轴：
+        // 沙箱权限决定 dsh 内部允不允许写文件、跑命令；运行权限决定本应用
+        // 能以什么身份起进程、能以什么身份执行命令。详见 Privilege.kt。
+        var privMode by remember { mutableStateOf(Privilege.getMode(context)) }
+        var pendingPrivDanger by remember { mutableStateOf<PrivMode?>(null) }
+
+        // 运行模式默认**折叠**成一行摘要。
+        //
+        // 三种模式各带一段说明，全展开会把权限页撑得很长，而它是个低频设置：
+        // 大多数人只需要确认「现在是什么模式」，只有要换的人才会展开。
+        var privExpanded by remember { mutableStateOf(false) }
+
+        // Shizuku 通道状态（决定「Shizuku 模式」能不能选中）。
+        //
+        // ★ 用分档状态而不是一个布尔 ★
+        //
+        // 之前存的是「有没有授权」的布尔，结果用户关掉 Shizuku 后界面仍显示
+        // 「已授权」—— 因为那个布尔只反映权限授予情况，不反映**服务是否在运行**。
+        // 分档之后「服务未运行」与「未授权」是两种不同文案、也是两条不同的
+        // 用户行动项（去启动服务 / 去点授权），不会再混为一谈。
+        //
+        // 初值**实时算**（不是读缓存），所以进页第一帧就是准的；
+        // 之后靠两条通道保持最新：
+        // 1. Privilege 的状态监听（授权结果 / binder 上下线）→ 立刻重读
+        // 2. 本页打开期间的低频轮询 —— 兜底。不同 Shizuku 版本对状态回调的
+        //    行为并不完全一致，轮询保证最多 1.5 秒内一定收敛到真实值。
+        var shzState by remember { mutableStateOf(Privilege.shizukuState(context)) }
+        val shzReady = shzState == Privilege.ShizukuState.READY
 
         // 是否允许启动「预检判定为不可运行」的引擎（默认关）。
         // 见 LauncherPrefs.getForceUnsupportedEngine 的注释。
@@ -2120,6 +2288,47 @@ class MainActivity : ComponentActivity() {
         // refreshTick 变化即重新读一遍真实系统状态
         val permEntries = remember(refreshTick) { PermissionCenter.entries(context) }
 
+        // ★ Shizuku 的授权结果**不会**走 ON_RESUME ★
+        //
+        // 授权框是叠在本页之上的一层（由 Shizuku 自己的进程弹出），用户点「允许」
+        // 时本应用通常没有经历 onPause → onResume —— 于是只靠上面那个生命周期
+        // 监听，状态会永远停在进页那一刻的旧值，表现就是「授权了却仍显示未授权」。
+        // 这里直接订 Shizuku 的回调（授权结果 / binder 上下线），拿到就重探。
+        DisposableEffect(Unit) {
+            val l = Privilege.StateListener {
+                // 回调线程上直接重算一次分档状态：这是唯一能让「点允许 → 立刻
+                // 变可点」发生在同一次回调里的地方，比等轮询快一个数量级。
+                shzState = Privilege.shizukuState(context)
+                refreshTick++
+            }
+            Privilege.addStateListener(l)
+            onDispose { Privilege.removeStateListener(l) }
+        }
+
+        // 运行权限的能力探测：probeRoot() 会起子进程（最多 3×2 秒），绝不能碰主线程。
+        // produceState 的块本身就是挂起上下文，withContext(IO) 再切到 IO 线程执行。
+        // 用 refreshTick 做 key：生命周期回前台、或 Shizuku 状态回调都会让它 +1。
+        val privCap by produceState(initialValue = PrivCapability(), refreshTick) {
+            value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                Privilege.probe(context)
+            }
+        }
+
+        // 通道状态的低频轮询（兜底）。
+        //
+        // 只算 shizukuState()：一次 binder ping + 一次权限查询，**不做** root 探测、
+        // 不起子进程，所以 1.5 秒一次的成本可以忽略。和当前值比对，变了才改状态，
+        // 避免无意义的重组。
+        LaunchedEffect(Unit) {
+            while (true) {
+                kotlinx.coroutines.delay(1500)
+                val now = kotlinx.coroutines.withContext(
+                    kotlinx.coroutines.Dispatchers.IO
+                ) { Privilege.shizukuState(context) }
+                if (now != shzState) shzState = now
+            }
+        }
+
         BackHandler(enabled = true) { onBack() }
 
         // 底色交给 PanelHost（它用 Fcl.PanelBg，跟随透明度滑块）。
@@ -2140,7 +2349,11 @@ class MainActivity : ComponentActivity() {
 
                 // 选项卡：面板内不再放「关闭」按钮，
                 // 收回靠侧栏的房子/退出图标或返回键（见 PanelHost）。
-                TabRow(
+                // PrimaryTabRow 取代了已过时的 TabRow（material3 1.4 起
+                // TabRow 被标记 deprecated，官方指向 Primary/Secondary 两种）。
+                // 这里是面板唯一一层选项卡，属于「主」层级，所以用 Primary。
+                // 参数名 containerColor / contentColor 两者一致，行为不变。
+                PrimaryTabRow(
                     selectedTabIndex = tab,
                     // 透明：让面板统一的半透明底色透上来
                     containerColor = Color.Transparent,
@@ -2302,6 +2515,9 @@ class MainActivity : ComponentActivity() {
                             lineHeight = 16.sp
                         )
 
+                        // 运行权限**不在这里** —— 它属于「权限设置」页，
+                        // 且默认折叠成一行摘要。放在这一页（启动器设置）里
+                        // 会让本就长的页面多出三大段说明，而它是个低频设置。
                         Spacer(modifier = Modifier.height(8.dp))
 
                         // ── 引擎兼容 ────────────────────────────────────────
@@ -2310,12 +2526,24 @@ class MainActivity : ComponentActivity() {
                         // 启动（不再把上百行堆栈倒给用户）。这个开关是那条判定
                         // 的唯一逃生口 —— 判定终归是静态推断，万一误判，用户
                         // 仍能强行尝试。
+                        //
+                        // ⚠️ 它原本要解决的问题**大部分已经被解决了**：
+                        // `NativeBindingGuard.preflight()` 现在会先自动装一个
+                        // 纯 JS 替身（RequireBuiltinShim）来顶替上游从未发布的
+                        // android 原生绑定，所以 rc.5 / alpha.2 这些版本本来就能起。
+                        //
+                        // 之所以还留着这个开关：预检是静态推断，替身也可能因
+                        // 存储不可写而装配失败。那时这是唯一能绕过预检的办法。
+                        // 但它的描述必须写实 —— 旧文案说「启动仍会失败并输出完整
+                        // 堆栈」，在替身生效的今天已经不成立，会误导用户以为
+                        // 这个版本注定起不来。
                         FclSettingSection("引擎兼容")
                         FclSettingRow(
                             label = "允许启动不受支持的引擎",
-                            description = "开启后跳过原生绑定预检，强行启动。" +
-                                "若引擎确实缺少上游未发布的 android 原生绑定，" +
-                                "启动仍会失败并输出完整堆栈。",
+                            description = "仅供排查用。启动前的原生绑定预检失败时，" +
+                                "开启它会跳过预检强行启动。注意：本启动器通常会自动装" +
+                                "纯 JS 替身来补齐缺失的 android 原生绑定，多数版本" +
+                                "无需开启此项。",
                             shape = RowShape.SINGLE,
                             onClick = {
                                 forceUnsupported = !forceUnsupported
@@ -2331,28 +2559,47 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
+                        Spacer(modifier = Modifier.height(6.dp))
+                        FclSettingSection("配置文件")
+                        FclSettingRow(
+                            label = "编辑配置文件",
+                            description = "AGENTS.md、profile 的 cordis.yml / package.json。" +
+                                "网页设置里的「打开配置文件」在 Android 上没有可用的桌面程序，入口在这里。",
+                            shape = RowShape.SINGLE,
+                            onClick = { ConfigEditorActivity.open(context, null) }
+                        ) {
+                            Text(
+                                text = "打开",
+                                color = Fcl.ThemeText,
+                                fontSize = 12.sp
+                            )
+                        }
+
                         Spacer(modifier = Modifier.height(8.dp))
 
                         // ── 诊断 ────────────────────────────────────────────
                         // 只读操作，结果全部写进运行日志（版本卡片齿轮可查看/复制）。
+                        //
+                        // 这里**只留一项**。原先还有「扫描 flock」与「检查平台可选包」，
+                        // 都是查 flock 那个老问题时加的取证工具，现在问题已由
+                        // `DSHRunner.ensureFlockShim()` 在每次启动时自动替换解决：
+                        //
+                        // · 「扫描 flock」按文本搜 `flock is not supported` 的出处 ——
+                        //   现在那个原生模块每次启动都会被换成纯 JS 实现，根本不会抛；
+                        //   而且它的结论「flock 用的是哪套实现」已经被下面这一项的
+                        //   输出覆盖（`diagnosePlatform` 会打印「flock 实现: …」）。
+                        // · 「检查平台可选包」当初基于一个**已被证伪**的假设
+                        //   （认为 `--omit=optional` 漏装了平台包才导致 flock 失败）。
+                        //   真实原因是 bionic 缺 `__errno_location`，任何 linux 二进制
+                        //   都加载不了；安装器现在也会整棵 node_modules 一起搬。
+                        //
+                        // 留着它们只会让用户点开一堆看不懂的输出。
                         FclSettingSection("诊断工具")
                         FclDiagnoseRow(
                             label = "平台信息",
-                            desc = "把 ABI、SDK、路径等运行时信息写入运行日志。",
-                            shape = RowShape.TOP,
+                            desc = "把 ABI、SDK、flock 实现等运行时信息写入运行日志。",
+                            shape = RowShape.SINGLE,
                             onRun = { Thread { DSHRunner.diagnosePlatform(context) }.start() }
-                        )
-                        FclDiagnoseRow(
-                            label = "扫描 flock",
-                            desc = "定位 flock 原生模块的实际加载路径。",
-                            shape = RowShape.MIDDLE,
-                            onRun = { Thread { DSHRunner.scanFlockSource(context) }.start() }
-                        )
-                        FclDiagnoseRow(
-                            label = "检查平台可选包",
-                            desc = "列出 npm 按平台装下来的可选包。",
-                            shape = RowShape.BOTTOM,
-                            onRun = { Thread { DSHRunner.listPlatformPackages(context) }.start() }
                         )
                     }
 
@@ -2476,6 +2723,206 @@ class MainActivity : ComponentActivity() {
                     }
 
                     if (tab == 2) {
+                        // ── 运行模式（默认折叠）────────────────────────────
+                        //
+                        // 与「启动器设置 → 沙箱权限」是两个正交的轴，别混：
+                        // · 沙箱权限 = dsh **内部**允不允许写文件/跑命令（环境变量）
+                        // · 运行模式 = 本应用以什么身份起进程、以什么身份执行命令
+                        //
+                        // 折叠成一行摘要：三种模式各带一段说明，全展开会把本页
+                        // 撑得很长，而它是低频设置 —— 多数人只需确认当前是什么模式。
+                        FclSettingSection("运行模式")
+
+                        val (curStatus, curColor) = privStatus(privMode, privCap, shzState)
+                        FclSettingRow(
+                            label = privMode.label,
+                            description = privMode.desc,
+                            shape = RowShape.SINGLE,
+                            // 折叠时最多两行，避免一行摘要被长说明撑成一大段；
+                            // 展开后完整显示（用户正在看选项，需要读全）。
+                            descMaxLines = if (privExpanded) null else 2,
+                            onClick = { privExpanded = !privExpanded }
+                        ) {
+                            Text(
+                                text = curStatus,
+                                color = curColor,
+                                fontSize = 10.sp
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (privExpanded) "收起" else "更换",
+                                color = Fcl.ThemeText,
+                                fontSize = 12.sp
+                            )
+                        }
+
+                        if (privExpanded) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            val privModes = PrivMode.values()
+                            privModes.forEachIndexed { i, option ->
+                                val selected = privMode == option
+                                val (statusText, statusColor) =
+                                    privStatus(option, privCap, shzState)
+
+                                // ★ 不可用的模式一律置灰、点击无效果 ★
+                                //
+                                // · Shizuku 未授权 → 选了也起不来通道
+                                // · Root 未检测到 su → 选了引擎根本起不来
+                                //
+                                // 为什么不「点了再提示」：那等于让用户先做出一个必然
+                                // 失败的选择，再告诉他不行。直接置灰是可预期的状态
+                                // 表达 —— 想选它，先把前提准备好（授权 / 装 su）。
+                                val locked = when (option) {
+                                    PrivMode.NORMAL -> false
+                                    // 只有「三个条件全满足」才可选：服务在线 + 已授权
+                                    // + 系统版本够。光「已授权」不够 —— 服务没起
+                                    // 的时候选上它只会让引擎起不来通道。
+                                    PrivMode.SHIZUKU -> !shzReady
+                                    PrivMode.ROOT -> !privCap.hasRoot
+                                }
+
+                                val rowContent: @Composable () -> Unit = {
+                                    FclSettingRow(
+                                        label = option.label,
+                                        description = option.desc,
+                                        shape = RowShape.of(i, privModes.size),
+                                        // onClick = null 时 FclSettingRow 不挂点击
+                                        // 修饰符，点下去真的一点反应都没有。
+                                        onClick = if (locked) null else {
+                                            {
+                                                if (option.dangerous) {
+                                                    // Root 改的是进程身份，代价不可
+                                                    // 撤销，必须二次确认。
+                                                    pendingPrivDanger = option
+                                                } else {
+                                                    privMode = option
+                                                    Privilege.setMode(context, option)
+                                                }
+                                            }
+                                        }
+                                    ) {
+                                        Text(
+                                            text = statusText,
+                                            color = if (locked) Fcl.TextTertiary else statusColor,
+                                            fontSize = 10.sp
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        RadioButton(
+                                            selected = selected,
+                                            // enabled=false 让圆点本身也是灰的，
+                                            // 与整行的置灰语义保持一致。
+                                            enabled = !locked,
+                                            onClick = null,
+                                            colors = RadioButtonDefaults.colors(
+                                                selectedColor = Fcl.Theme,
+                                                unselectedColor = Fcl.TextTertiary
+                                            )
+                                        )
+                                    }
+                                }
+
+                                // 置灰用整层 alpha，而不是逐个改 FclSettingRow 内部配色
+                                // —— 后者要动公共组件，且容易漏掉描述文字。
+                                if (locked) {
+                                    Box(modifier = Modifier.graphicsLayer { alpha = 0.45f }) {
+                                        rowContent()
+                                    }
+                                } else {
+                                    rowContent()
+                                }
+                            }
+                        }
+
+                        // 通道没就绪时的**可行动指引**。
+                        //
+                        // 条件不再限定「当前已选中 Shizuku 模式」：那一行已经置灰、
+                        // 点了没反应，若还要求先选上它才显示这里，就形成了死锁。
+                        //
+                        // ★ 三种状态给三条不同指引 ★
+                        //
+                        // 这不是文案讲究 —— 「服务没运行」时点「申请授权」是**无效**的
+                        // （requestShizukuPermission 会因 !shizukuRunning() 直接返回），
+                        // 用户会以为按钮坏了。所以那种情况必须让他先去启动服务。
+                        if (!shzReady && privCap.hasShizuku) {
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            val (guideLabel, guideDesc, guideAction, canAct) =
+                                when (shzState) {
+                                    Privilege.ShizukuState.UNSUPPORTED -> PrivGuide(
+                                        "Shizuku 不可用",
+                                        "Shizuku 需要 Android 7.0 及以上，本机版本过低。",
+                                        "", false
+                                    )
+                                    Privilege.ShizukuState.NOT_INSTALLED -> PrivGuide(
+                                        "未安装 Shizuku",
+                                        "请先安装 Shizuku 应用，并用无线调试或 root 启动它的服务。",
+                                        "", false
+                                    )
+                                    Privilege.ShizukuState.NOT_RUNNING -> PrivGuide(
+                                        "Shizuku 服务未运行",
+                                        "本机装了 Shizuku，但它的服务没有在跑，或 binder 还没送达 —— " +
+                                            "此时「申请授权」不会有任何反应。\n" +
+                                            "1) 打开 Shizuku 应用，用「无线调试」配对或 root " +
+                                            "启动服务，主页显示「运行中」；\n" +
+                                            "2) 若服务已在运行但这一行仍不变，把本应用**从最近任务" +
+                                            "里划掉重开** —— binder 只在 Shizuku 服务启动或应用进程" +
+                                            "启动时投递一次。",
+                                        "", false
+                                    )
+                                    else -> PrivGuide(
+                                        "请求 Shizuku 授权",
+                                        "服务已在运行，但本应用还没被授权。" +
+                                            "点此让 Shizuku 弹出授权框；也可以直接在 Shizuku " +
+                                            "的「应用管理」里打开 FCL-DSH 的开关 —— " +
+                                            "两种方式效果一样。",
+                                        "申请", true
+                                    )
+                                }
+
+                            FclSettingRow(
+                                label = guideLabel,
+                                description = guideDesc,
+                                shape = RowShape.SINGLE,
+                                onClick = if (!canAct) null else {
+                                    {
+                                        Privilege.requestShizukuPermission(
+                                            context, explicit = true
+                                        )
+                                        hint(
+                                            "已请求授权。若没弹窗，请到 Shizuku 的" +
+                                                "「应用管理」里手动打开 FCL-DSH 的开关"
+                                        )
+                                    }
+                                }
+                            ) {
+                                if (guideAction.isNotEmpty()) {
+                                    Text(
+                                        text = guideAction,
+                                        color = Fcl.ThemeText,
+                                        fontSize = 12.sp
+                                    )
+                                } else {
+                                    Text(
+                                        text = "待处理",
+                                        color = Fcl.TextTertiary,
+                                        fontSize = 10.sp
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "运行模式在重启实例（主界面「停止」再「启动」）后生效。" +
+                                "切到 Root 模式前请留意：以 root 起的进程会把数据目录下" +
+                                "文件的属主改成 root，之后切回普通模式可能读不了。",
+                            color = Fcl.TextTertiary,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
                         // ── 权限中心 ────────────────────────────────────────
                         FclSettingSection("特殊权限")
                         permEntries.forEachIndexed { i, entry ->
@@ -2715,7 +3162,84 @@ class MainActivity : ComponentActivity() {
                 }
             )
         }
+
+        // 运行权限的危险模式（Root）二次确认。
+        // 与「完全访问」分开做弹窗：两者的后果完全不同 —— 一个是沙箱内的策略，
+        // 一个是整个引擎以 uid 0 运行。
+        pendingPrivDanger?.let { dangerous ->
+            AlertDialog(
+                onDismissRequest = { pendingPrivDanger = null },
+                title = { Text("切换到${dangerous.label}？") },
+                text = {
+                    Text(
+                        dangerous.desc + "\n\n" +
+                            "切换后需要「停止」再「启动」实例才会生效。"
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        privMode = dangerous
+                        Privilege.setMode(context, dangerous)
+                        Privilege.invalidateSuCache()
+                        pendingPrivDanger = null
+                        hint("已切换到${dangerous.label}，重启实例后生效")
+                    }) { Text("我了解风险，切换") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingPrivDanger = null }) { Text("取消") }
+                }
+            )
+        }
     }
+
+    /**
+     * 运行权限一行右侧的状态文案与颜色。
+     *
+     * ## 为什么参数是 [Privilege.ShizukuState] 而不是一个布尔
+     *
+     * 早先这里收的是「有没有授权」。那个写法有一个致命的表达缺陷：
+     * **「已授权但服务没在运行」无法表示**。实际情况恰恰就是这一种 ——
+     * 用户关掉 Shizuku 之后，权限仍是授予状态，界面于是继续显示「已授权」，
+     * 而 `shz` 命令压根不存在、`id -u` 还是应用 uid。
+     *
+     * 分五档之后每一档都有自己的文案与颜色，用户能直接看出该做什么：
+     * 升级系统 / 装 Shizuku / **启动服务** / 去授权 / 可以用。
+     *
+     * 纯读状态、不起子进程，可以在主线程调用 —— 状态由 [shzState] 提供，
+     * 真正的探测在 [privCap] 里由后台线程完成，这里只消费结果。
+     */
+    private fun privStatus(
+        option: PrivMode,
+        cap: PrivCapability,
+        state: Privilege.ShizukuState
+    ): Pair<String, androidx.compose.ui.graphics.Color> =
+        when (option) {
+            PrivMode.NORMAL -> "始终可用" to Fcl.Success
+
+            PrivMode.SHIZUKU -> when (state) {
+                Privilege.ShizukuState.UNSUPPORTED ->
+                    "需 Android 7+" to Fcl.TextTertiary
+
+                Privilege.ShizukuState.NOT_INSTALLED ->
+                    "未安装" to Fcl.TextTertiary
+
+                // ★ 这一档是最容易误导的一档，必须单独说 ★
+                // 「已授权」在这里是**假象**：服务没跑，binder 是死的，
+                // 任何 Shizuku 调用都不会成功。所以文案强调「服务未运行」。
+                Privilege.ShizukuState.NOT_RUNNING ->
+                    "服务未运行" to Fcl.Warning
+
+                Privilege.ShizukuState.NOT_GRANTED ->
+                    "未授权" to Fcl.Warning
+
+                Privilege.ShizukuState.READY ->
+                    "已授权" to Fcl.Success
+            }
+
+            PrivMode.ROOT ->
+                if (cap.hasRoot) "已检测到 su" to Fcl.Success
+                else "未检测到 su" to Fcl.Warning
+        }
 
     /**
      * 权限中心的一行。
@@ -2833,10 +3357,28 @@ class MainActivity : ComponentActivity() {
         // 记住上次页签反而会让人以为面板没被重置。
         var tab by remember { mutableStateOf(DownloadTab.DSH) }
 
-        // 待命名的安装目标版本。非空时弹出「实例命名」小窗 ——
-        // 同一个版本可以建多个实例，所以点「下载」不能直接开工，
-        // 必须先确定这次要装成哪个实例（否则会默认覆盖已有实例）。
+        // ── 命名（显示标签）相关状态 ────────────────────────────────────
+        //
+        // 这套东西**只加显示名**，不动版本键、不动目录名、不动 DSH_HOME。
+        // 版本键是身份标识（见 Instances 的注释），改了会让会话挂载失败、
+        // 数据目录错位。所以标签做成旁挂在 SharedPreferences 上的一张表。
+        //
+        // 两个待命名目标互斥：
+        // · [namingVersion] 非空 → 从 registry 下载，值是版本号
+        // · [namingLocal] 为真   → 从本地压缩包安装
+        var namingVersion by remember { mutableStateOf<String?>(null) }
+        var namingLocal by remember { mutableStateOf(false) }
+
+        // 已确认名字、待开工的网络安装版本。
         var pendingInstallVersion by remember { mutableStateOf<String?>(null) }
+
+        // 用户确认的标签，等安装成功、拿到**真正的版本键**之后才落盘。
+        //
+        // ⚠️ 不能在确认时就写：那一刻还不知道这次会落成哪个键
+        // （同版本装第二次会被 allocateVersion 加成 `xxx-2`）。
+        // 两个安装器落盘后都会调 DSHRunner.setCurrentVersion(key)，
+        // 所以 DONE 时读 currentVersion 才是准的。
+        var pendingLabel by remember { mutableStateOf<String?>(null) }
 
         // 安装 / 建实例之后的刷新触发器。
         //
@@ -3028,8 +3570,10 @@ class MainActivity : ComponentActivity() {
                                     // 否则会默认覆盖掉已有实例。
                                     TextButton(
                                         onClick = {
-                                            EngineInstaller.selectedVersion = v
-                                            pendingInstallVersion = v
+                                            // 只打开命名小窗；真正安装要等用户确认名字。
+                                            // 默认名直接用版本号（含 allocateVersion 才会
+                                            // 决定的后缀是装完之后的事，这里给版本号即可）。
+                                            namingVersion = v
                                         },
                                         enabled = !busy,
                                         contentPadding = PaddingValues(
@@ -3125,11 +3669,11 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // ── 安装：直接开工，不再让用户起名字 / 确认 ──────────────────────
+        // ── 已确认名字 → 开工（网络安装）──────────────────────────────────
         //
-        // 部署的标识就是**版本号本身**（`usr/lib/versions/` 下的目录名）。
-        // 同一个版本装第二次时，Instances.allocateVersion 会自动加后缀
-        // （`0.2.1` → `0.2.1-2`），所以既不需要用户干预，也不会覆盖已有部署。
+        // 部署的标识仍是**版本号本身**（`usr/lib/versions/` 下的目录名），
+        // 同一个版本装第二次时由 Instances.allocateVersion 自动加后缀。
+        // 这里额外记的只是一个显示标签，不影响任何路径。
         val pending = pendingInstallVersion
         if (pending != null) {
             pendingInstallVersion = null
@@ -3137,21 +3681,105 @@ class MainActivity : ComponentActivity() {
             EngineInstaller.installVersion(context, pending)
         }
 
-        // ── 本地包：同样直接开工 ────────────────────────────────────────
+        // ── 本地包：先弹命名窗，不直接开工 ──────────────────────────────
         //
-        // 流要现开现用：不提前打开，避免「选完文件后放置太久」失效。
+        // ⚠️ 这里**不清** pendingLocalZip：用户点取消就什么都不做，
+        // 下次进来还能重来。清掉它的是命名窗的两个回调。
         val localZip = pendingLocalZip
-        if (localZip != null) {
-            pendingLocalZip = null
-            val stream = runCatching {
-                context.contentResolver.openInputStream(localZip)
-            }.getOrNull()
-            if (stream != null) {
-                DshEngineDownloader.installFrom(context, stream, "本地引擎包")
+        if (localZip != null && !namingLocal) {
+            namingLocal = true
+        }
+
+        // ── 命名小窗 ────────────────────────────────────────────────────
+        //
+        // 只加**显示标签**：版本键、目录名、DSH_HOME 一律不动。
+        // 版本键是身份标识（见 Instances 的注释），改了会让会话挂载失败。
+        val nv = namingVersion
+        if (nv != null || namingLocal) {
+            VersionLabelDialog(
+                title = "给它起个名字",
+                hint = if (nv != null) {
+                    "引擎版本 $nv。名字只用于界面显示，不会改变版本目录。"
+                } else {
+                    "从本地压缩包安装。默认用文件名，装完后显示这个名字。"
+                },
+                defaultName = if (nv != null) {
+                    VersionLabels.defaultFor(nv)
+                } else {
+                    VersionLabels.fromFileName(pendingLocalZipName) ?: "本地引擎包"
+                },
+                onDismiss = {
+                    namingVersion = null
+                    namingLocal = false
+                    // 取消本地安装：把选择清掉，避免下次进面板又弹一次
+                    pendingLocalZip = null
+                    pendingLocalZipName = null
+                },
+                onConfirm = { label ->
+                    namingVersion = null
+                    namingLocal = false
+                    if (label.isNotBlank()) pendingLabel = label
+
+                    if (nv != null) {
+                        pendingInstallVersion = nv
+                    } else {
+                        // 流要现开现用：不提前打开，避免「选完文件后放置太久」失效。
+                        val zip = pendingLocalZip
+                        pendingLocalZip = null
+                        val stream = runCatching {
+                            zip?.let { context.contentResolver.openInputStream(it) }
+                        }.getOrNull()
+                        if (stream != null) {
+                            DshEngineDownloader.installFrom(context, stream, "本地引擎包")
+                        }
+                        pendingLocalZipName = null
+                        instanceTick++
+                    }
+                }
+            )
+        }
+
+        // ── 安装结束时把标签落到真正的版本键上（或丢弃）──────────────────
+        //
+        // 两个安装器落盘后都会调 DSHRunner.setCurrentVersion(key)，
+        // 所以这里读 currentVersion 拿到的就是**刚装的那个键** ——
+        // 不必自己推算 `-2` 后缀，也不会写错到别的版本上。
+        //
+        // ★ 失败 / 取消时必须把 pendingLabel 丢掉 ★
+        //
+        // 它是跨安装保留的状态。如果装到一半失败或被取消而不清空，
+        // 用户下次**成功**装另一个版本时，这个旧名字就会被写到那个版本上 ——
+        // 表现为「装完 B，B 却叫成了 A 的名字」，且完全查不出来源。
+        //
+        // 为什么把 IDLE 也算作「放弃」：设 pendingLabel 不会改变本 effect 的
+        // key（两个 phase），而两个安装器都是**同步**把 phase 置成 INSTALLING
+        // 的（在同一个点击回调内、重组之前）。所以这里看到 IDLE，只可能是
+        // 「首次组合」或「从非 IDLE 回到 IDLE（取消）」，不会误伤刚确认的那次。
+        LaunchedEffect(EngineInstaller.installPhase, DshEngineDownloader.phase) {
+            val ei = EngineInstaller.installPhase
+            val di = DshEngineDownloader.phase
+
+            val aborted = ei == EngineInstaller.InstallPhase.ERROR ||
+                di == DshEngineDownloader.Phase.ERROR ||
+                ei == EngineInstaller.InstallPhase.IDLE ||
+                di == DshEngineDownloader.Phase.IDLE
+            if (aborted) {
+                // 没有待写标签时这一步是空操作，不必额外判断
+                pendingLabel = null
+                return@LaunchedEffect
             }
-            // 读不到文件时不做任何改动：列表里不会留下半个部署，
-            // 因为版本目录是解压成功之后才出现的。
-            instanceTick++
+
+            val done = ei == EngineInstaller.InstallPhase.DONE ||
+                di == DshEngineDownloader.Phase.DONE
+            if (!done) return@LaunchedEffect
+
+            val label = pendingLabel ?: return@LaunchedEffect
+            pendingLabel = null
+            val key = DSHRunner.currentVersion(context)
+            if (key != null) {
+                VersionLabels.set(context, key, label)
+                instanceTick++
+            }
         }
 
         // ── 居中模态进度窗 ──────────────────────────────────────────────
@@ -3310,161 +3938,6 @@ class MainActivity : ComponentActivity() {
                             OutlinedButton(onClick = onCancel) { Text("取消安装") }
                         } else {
                             TextButton(onClick = onDismiss) { Text("关闭") }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * 安装前给实例命名的小窗。
-     *
-     * ## 为什么要弹这一步
-     *
-     * 同一个 dsh 版本可以建多个实例，每个实例装一份引擎、一套 HOME 与工作区，
-     * 互不相通。若点「下载」就直接开工，第一个实例会被第二个悄悄覆盖 ——
-     * 用户看到的是「装完了，但上一个实例里聊的东西不见了」。
-     * 所以命名是安装的必要前置，不是可选步骤。
-     *
-     * ## 默认名与重名后缀
-     *
-     * 默认名取 `dsh-<版本>`。若已被占用，[Instances.suggestName] 会直接给出
-     * 带后缀的可用名（`dsh-0.2.1-2`、`-3`…），所以**用户什么都不改也能按确定** ——
-     * 这正是需求说的「提前发现有同名实例时，默认名称会自动加后缀」。
-     *
-     * 用户手工把名字改成另一个已存在的实例时，**确定也不会被拦**：同样自动
-     * 加后缀。实例的标识只有名称，所以重名意味着「再并存一个」而不是
-     * 「覆盖原来那个」；下载同一版本、反复从本地装同一个包都靠这条路径
-     * 实现同版本共存。「名称为空」才拦。
-     *
-     * ## 为什么 onConfirm 返回 String?
-     *
-     * 建目录/写元数据可能失败（磁盘满、权限）。返回非空字符串表示失败原因，
-     * 窗口保持打开并把原因显示出来；返回 null 表示成功，由调用方关窗。
-     * 若只返回 Unit，失败时窗口已经关掉，用户就只剩一句日志可看。
-     *
-     * @param version 要安装的引擎版本号；从 registry 下载时是确切版本。
-     * @param nameBase 默认名的基名。默认 `dsh-<版本>`；从本地 zip 安装时
-     *   选择那一刻还读不到版本号（要解析包内 package.json），所以调用方传
-     *   `dsh`，等装完由安装器把真实版本回写进实例元数据。
-     * @param versionHint 描述里那句「这是哪个版本」。本地包传一句说明，
-     *   避免显示成「引擎版本 本地安装包」这种不通的话。
-     * @param onConfirm 传入选定的名字；返回 null 表示已创建成功。
-     */
-    @Composable
-    private fun InstanceNameDialog(
-        version: String,
-        onDismiss: () -> Unit,
-        onConfirm: (String) -> String?,
-        nameBase: String = "dsh-$version",
-        versionHint: String = "引擎版本 $version。"
-    ) {
-        val context = LocalContext.current
-
-        // 默认名按基名算一次。用 remember(nameBase) 而不是 remember：
-        // 同一个小窗被复用于另一个版本（或另一条安装路径）时，
-        // 默认名必须跟着换，否则会把上一次算出来的残留名带过去。
-        val baseName = nameBase
-        // 命名窗已不再被任何调用点使用：安装改为按「版本号 + 自动后缀」分配目录名，
-        // 不需要用户起名字。这里保留最小实现，只为不打断既有渲染代码。
-        val autoRenamed = false
-        var name by remember(baseName) { mutableStateOf(baseName) }
-        var error by remember(baseName) { mutableStateOf<String?>(null) }
-
-        Dialog(
-            onDismissRequest = onDismiss,
-            properties = DialogProperties(
-                dismissOnBackPress = true,
-                dismissOnClickOutside = true,
-                usePlatformDefaultWidth = false
-            )
-        ) {
-            Surface(
-                modifier = Modifier.width(340.dp),
-                shape = RoundedCornerShape(Fcl.Radius),
-                color = Fcl.DialogBg
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Text(
-                        text = "给实例命名",
-                        color = Fcl.TextPrimary,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Text(
-                        text = versionHint +
-                            "同一版本可以建多个实例，各自一套引擎、工作区与会话，互不相通。",
-                        color = Fcl.TextSecondary,
-                        fontSize = 11.sp,
-                        lineHeight = 16.sp
-                    )
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    OutlinedTextField(
-                        value = name,
-                        onValueChange = {
-                            name = it
-                            // 用户一动手就把上次的报错清掉，避免红色提示一直挂着
-                            error = null
-                        },
-                        singleLine = true,
-                        isError = error != null,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    // 自动加过后缀就明说一句，否则用户会以为默认名本来就长这样
-                    if (autoRenamed && error == null) {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "已存在同名实例，默认名已自动加后缀。",
-                            color = Fcl.TextTertiary,
-                            fontSize = 10.sp,
-                            lineHeight = 14.sp
-                        )
-                    }
-
-                    if (error != null) {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = error!!,
-                            color = Fcl.Danger,
-                            fontSize = 10.sp,
-                            lineHeight = 14.sp
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        TextButton(onClick = onDismiss) { Text("取消") }
-                        Spacer(modifier = Modifier.width(4.dp))
-                        // 只有「名称为空」才拦。重名不拦 —— 见下面的说明。
-                        TextButton(
-                            onClick = {
-                                val clean = name.trim()
-                                if (clean.isEmpty()) {
-                                    error = "名称不能为空"
-                                    return@TextButton
-                                }
-                                // ★ 重名自动追加后缀，不再报错 ★
-                                //
-                                // 实例的标识只有名称，所以撞名意味着「再并存一个」，
-                                // 而不是「覆盖原来那个」：下载同一个版本、或反复从
-                                // 本地安装同一个包，正是要这样多开几个实例。
-                                // [Instances.create] 内部也做了同样的处理，这里先算一次
-                                // 是为了把最终名字交给 onConfirm —— 调用方用它切当前实例。
-                                error = onConfirm(clean)
-                            }
-                        ) {
-                            Text("确定", color = Fcl.ThemeText)
                         }
                     }
                 }

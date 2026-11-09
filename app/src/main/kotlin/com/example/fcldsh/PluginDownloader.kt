@@ -569,7 +569,7 @@ object PluginDownloader {
                 connectTimeout = 15_000
                 readTimeout = 30_000
                 instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "fcl-dsh/1.0 (Android)")
+                setRequestProperty("User-Agent", "fcl-dsh/${BuildConfig.VERSION_NAME} (Android)")
                 setRequestProperty("Accept", "application/json")
             }
             conn = c
@@ -593,7 +593,7 @@ object PluginDownloader {
                 connectTimeout = 15_000
                 readTimeout = 60_000
                 instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "fcl-dsh/1.0 (Android)")
+                setRequestProperty("User-Agent", "fcl-dsh/${BuildConfig.VERSION_NAME} (Android)")
             }
             conn = c
             if (c.responseCode !in 200..299) {

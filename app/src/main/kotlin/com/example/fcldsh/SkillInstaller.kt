@@ -263,7 +263,7 @@ object SkillInstaller {
             connectTimeout = 15_000
             readTimeout = 60_000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "fcl-dsh/1.0 (Android)")
+            setRequestProperty("User-Agent", "fcl-dsh/${BuildConfig.VERSION_NAME} (Android)")
         }
 
     private fun fetchText(url: String): String {

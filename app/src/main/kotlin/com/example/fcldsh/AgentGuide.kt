@@ -90,7 +90,7 @@ object AgentGuide {
         val home = com.appHomeDir(app)
         val workspace = workspacePackageDir(app)
 
-        val body = buildBlock()
+        val body = buildBlock(app)
 
         // 1) $DSH_HOME/AGENTS.md —— 主入口，dsh 无条件注入每个会话
         runCatching {
@@ -152,7 +152,7 @@ object AgentGuide {
      * 然后列出端点与限制。刻意把「做不到什么」写清楚 ——
      * 否则 agent 会反复尝试截图或 shell 级命令，浪费轮次。
      */
-    private fun buildBlock(): String {
+    private fun buildBlock(context: Context): String {
         // 只取端口（用于文档里提一句「走的是哪个端口」）。
         //
         // 刻意**不把 token 写进 AGENTS.md**：鉴权已由 `a11y` 命令内部完成，
@@ -160,6 +160,28 @@ object AgentGuide {
         // 等于把「读屏 + 代替用户点击」的钥匙抄进对话上下文 —— 没有必要且危险。
         val port = A11yBridgeServer.port
         val running = A11yBridgeServer.isRunning() && port > 0
+
+        // 运行权限：让 agent 一开口就知道「自己现在是什么身份、能做什么」。
+        // 这一点比它看起来重要 —— 不知道身份的模型会去试 `su`、或者反过来
+        // 在 root 模式下小心翼翼地绕路，两种情况都是纯浪费。
+        val priv = privilegeSection(context)
+
+        // 「跨应用 shell」这一条要跟着运行权限走。
+        //
+        // 写死成「不可用」的话，Shizuku / Root 模式下 agent 明明有能力也不敢用，
+        // 只能绕远路靠 `a11y` 一个个点；反过来在普通模式下写「可以用」，
+        // 它会去调 `input tap` 然后被 SELinux 拒绝，白费几轮。
+        val mode = Privilege.getMode(context)
+        val crossAppShell = when {
+            (mode == PrivMode.ROOT && Privilege.hasKnownRoot()) ||
+                (mode == PrivMode.SHIZUKU && Privilege.shizukuModeSelectable()) ->
+                "**跨应用 shell**：本模式有能力，用 `shz input tap ...`、" +
+                    "`shz am start ...` 执行（Root 模式下直接去掉 `shz` 前缀）。"
+            else ->
+                "**跨应用任意 shell 操作**：`input tap`、`am start` 等需要 shell 权限，" +
+                    "不可用。替代方案是 `a11y tapText`、`a11y back`、`a11y home`。\n" +
+                    "  这类命令在当前运行权限下必然被拒绝，不要反复重试。"
+        }
 
         // 注意 margin 前缀用 `¦` 而不是默认的 `|`。
         // trimMargin() 默认剥掉行首的 `|`，而这份文档里有 Markdown 表格，
@@ -205,6 +227,8 @@ object AgentGuide {
         ¦你运行在一个 Android 应用内置的 Node 环境里，**当前设备就是用户正在用的手机**。
         ¦该应用提供了「**截图** + 读屏 + 模拟点击」能力，并已把它包装成 PATH 上的
         ¦`a11y` 命令 —— 不需要 root，不需要 Shizuku，也不需要自己找端口或 token。
+        ¦
+        ¦$priv
         ¦
         ¦## 快速开始
         ¦
@@ -504,8 +528,7 @@ object AgentGuide {
         ¦
         ¦## 已知做不到（不要在这些上浪费轮次）
         ¦
-        ¦- **跨应用任意 shell 操作**：`input tap`、`am start` 等需要 shell 权限，不可用。
-        ¦  替代方案是 `a11y tapText`、`a11y back`、`a11y home`。
+        ¦- $crossAppShell
         ¦- **`screencap` / `screenrecord` / `uiautomator dump` / `dumpsys`**：
         ¦  这些原生命令在本沙箱里必然失败（链接错误、`no display`、`Permission Denial`）。
         ¦  截图一律用 `a11y shot`，读屏一律用 `a11y screen` / `a11y tree`。
@@ -519,5 +542,122 @@ object AgentGuide {
         ¦**不需要**也**不要**去读 `~/a11y-bridge.json`（`a11y` 已内置鉴权）——
         ¦更不要把它的内容贴进对话、日志或提交到代码库。
         """.trimMargin("¦")
+    }
+
+    /**
+     * 「你的运行权限」章节 —— 让 agent 一开口就知道自己是什么身份、能做什么。
+     *
+     * ## 为什么必须写进 AGENTS.md，而不是只让 agent 自己探
+     *
+     * 不告诉它身份时，模型在两种情况都会浪费时间：
+     * - 普通模式下反复试 `su` / `shz`，每次失败还要再换一种写法；
+     * - root 模式下反而畏手畏脚，绕着弯子用 `a11y` 去做本就该直接改文件的事。
+     *
+     * 一次写清楚「你是什么身份、边界在哪、有哪条额外通道」，比让它试错便宜得多。
+     *
+     * ## 只用只读状态，不起子进程
+     *
+     * 本函数会被 [refresh] 调用，而 [refresh] 可能在主线程上
+     * （`A11yBridgeServer.start` → `writeDiscovery`）。所以这里**绝不**调
+     * [Privilege.probeRoot]（最多起 3 个子进程、首次还会弹 Magisk 授权框），
+     * 只读模式偏好与两个 Volatile 缓存。
+     */
+    private fun privilegeSection(context: Context): String {
+        val mode = Privilege.getMode(context)
+        val shzReady = Privilege.shizukuModeSelectable()
+        val hasRoot = Privilege.hasKnownRoot()
+
+        val body = when (mode) {
+            PrivMode.NORMAL -> """
+                ¦## 你的运行权限：普通模式
+                ¦
+                ¦引擎与本应用**同一个应用 UID**，你执行的所有命令都受这条边界约束：
+                ¦
+                ¦- 能读写：`${'$'}PREFIX`（容器）、`${'$'}HOME`、`${'$'}DSH_HOME`、已授权的共享存储
+                ¦- **不能**：碰别的应用的数据、杀别人的进程、改系统文件
+                ¦- `shz` 命令**不可用**（不存在，或调用必然失败）。不要试它，也不要试 `su`
+                ¦
+                ¦需要跨应用能力时，只能用 `a11y` 那套（读屏 + 点击）——
+                ¦那是本模式唯一可用的对外操作通道。
+            """.trimMargin("¦")
+
+            PrivMode.SHIZUKU -> if (shzReady) """
+                ¦## 你的运行权限：Shizuku 模式（已授权）
+                ¦
+                ¦引擎本身仍以**应用 UID** 运行 —— Shizuku 改不了子进程的 uid，
+                ¦所以在 bash 里直接敲的命令仍是应用身份。
+                ¦
+                ¦但这个模式多了一条 **adb 身份**的通道：`shz <命令>`。
+                ¦它由应用转发给 Shizuku 服务，以 `uid=2000(adb/shell)` 执行。
+                ¦
+                ¦```bash
+                ¦shz id                    # 先确认：应看到 uid=2000(adb)
+                ¦shz pm list packages      # 列出全部已安装应用（应用身份做不到）
+                ¦shz am force-stop <包名>   # 强制停止别的应用
+                ¦shz kill <pid>            # 结束别人的进程
+                ¦shz dumpsys activity      # 系统级信息
+                ¦```
+                ¦
+                ¦`shz` 打不开时先跑 `shz status`，看 `shizukuRunning` 与 `shizukuGranted`。
+                ¦
+                ¦⚠️ 它**不是 root**：不能写 `/system`、不能改别的应用的私有文件。
+                ¦需要 root 时请用户切到「Root 模式」；用 `shz su` 提权没有意义。
+            """.trimMargin("¦") else """
+                ¦## 你的运行权限：Shizuku 模式（**通道未就绪**）
+                ¦
+                ¦用户在设置里选了 Shizuku 模式，但此刻通道建不起来。
+                ¦原因只有两种，处理方式完全不同：
+                ¦
+                ¦| 情况 | 判断依据 | 用户要做什么 |
+                ¦|---|---|---|
+                ¦| **服务没在运行 / binder 未送达** | 通知栏没有 Shizuku 常驻通知；`pingBinder()` 为假 | ① 打开 Shizuku 应用，用「无线调试」配对或 root 启动服务，主页显示「运行中」；② 若服务已在运行而状态仍不变，让用户把本应用从最近任务里划掉重开 —— binder 只在 Shizuku 服务启动或应用进程启动时投递一次 |
+                ¦| **服务在跑但未授权** | 服务可见，但本应用没被授权 | 设置 → 权限设置 → 运行模式 → 点「申请」；或在 Shizuku 的「应用管理」里打开 FCL-DSH 的开关 |
+                ¦
+                ¦**这时 `shz` 命令不存在**（连不上就不会生成它），执行会得到 127。
+                ¦
+                ¦- **不要**反复试 `shz`，也不要自己去找端口或 `shz-bridge.json` —— 都不存在。
+                ¦- 需要跨应用操作时，先退回 `a11y`（读屏 + 点击）。
+                ¦- 通道是**事件驱动**的：服务一旦起来、授权一旦到位，只要引擎在跑，
+                ¦  `shz` 会立刻出现，**不需要重启引擎**。所以告诉用户去启动服务即可，
+                ¦  不必让他重启实例。
+            """.trimMargin("¦")
+
+            PrivMode.ROOT -> if (hasRoot) """
+                ¦## 你的运行权限：Root 模式
+                ¦
+                ¦整个引擎以 `uid=0` 启动，你执行的**每一条命令都是 root**：
+                ¦
+                ¦- **不需要** `su -c` 前缀，直接写命令
+                ¦- 能读写全盘、改系统文件、管理任意进程与应用
+                ¦- 只受内核与 SELinux 策略约束
+                ¦
+                ¦```bash
+                ¦id                        # 确认：应为 uid=0(root)
+                ¦ls /data/data             # 所有应用的私有目录都可见
+                ¦```
+                ¦
+                ¦⚠️ **这里的破坏是不可撤销的**：没有回收站，也没有备份。
+                ¦删错文件、改错系统配置都可能让设备无法开机。
+                ¦
+                ¦所以：只读探查（`ls` / `cat` / `ps` / `dumpsys`）尽管做；
+                ¦**写操作一次只做一件事**，动手前先说明你要改哪个路径；
+                ¦不确定就先问用户。不要批量 `rm -rf`，不要在未确认的情况下
+                ¦动 `/system`、`/data/adb` 这类位置。
+            """.trimMargin("¦") else """
+                ¦## 你的运行权限：Root 模式（**未检测到可用的 su**）
+                ¦
+                ¦用户在设置里选了 Root 模式，但本机**没有实测可用的 su**。
+                ¦
+                ¦- 引擎可能根本起不来（启动时会拒绝执行并写日志）。
+                ¦- 即便起来了也不要假定自己有 root —— 先用 `id` 确认。
+                ¦- 应转告用户：确认设备已 root（Magisk / KernelSU）并已授权本应用，
+                ¦  或到 设置 → 权限设置 → 运行模式 切回普通模式。
+            """.trimMargin("¦")
+        }
+
+        // 模式是**引擎启动时**下发的，改完必须重启实例才生效 ——
+        // 这一点不写清楚，agent 会在用户切完模式后仍按旧身份行事。
+        return body.trimEnd() + "\n\n" +
+            "该模式在引擎**启动时**生效；用户改动后需要重启实例（主界面「停止」再「启动」）。\n"
     }
 }

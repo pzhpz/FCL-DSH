@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
-    package="com.example.fcldsh">
+    package="com.example.fcldsh"
+    android:versionCode="29"
+    android:versionName="2.3.0">
 
     <!--
         ★ 必须显式放行 Shizuku 三个库的 minSdk 检查 ★
@@ -56,6 +58,20 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- 申请忽略电池优化，避免后台 Node 进程被系统杀掉 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!--
+        任务悬浮窗（TaskOverlay.kt）。
+
+        这是**特殊权限**，没有运行时申请通道：requestPermissions() 对它无效，
+        系统只会回 PERMISSION_DENIED 且不弹框。只能由用户到
+        「设置 → 特殊应用权限 → 显示在其他应用上层」手动拨开关，
+        应用内的入口只是把用户送到那一页（见 PermissionCenter.overlay）。
+
+        不声明的话 addView 会直接抛 BadTokenException；
+        声明了但没授权，同样会失败 —— 所以 TaskOverlay.show() 里
+        先查 Settings.canDrawOverlays 再 addView，并把 addView 包在 runCatching 内。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <!--
         引擎下载/安装期间的保活：前台服务 + CPU 唤醒锁。
@@ -250,6 +266,40 @@
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
+        </provider>
+
+        <!--
+            ★ 把沙箱容器暴露进系统文件选择器（端口：SAF）★
+
+            这就是截图里 CodeAssist「App files」、FCL、ZeroTermux
+            「可用空间: 32.89 GB」那一行 —— 它们不是挂载，全是 DocumentsProvider。
+            本 provider 让系统的「打开文档 / 保存到」列表里出现
+            「FCL-DSH 容器」，点进去是 `filesDir/home` 与 `filesDir/usr`。
+
+            三个属性都不能省：
+            · android:permission="android.permission.MANAGE_DOCUMENTS"
+              这是签名级权限，只有系统进程（DocumentsUI）持有。**不能改成
+              exported=false** —— 调用方是别的进程，不导出就永远调不到；
+              安全性由这条权限保证，普通第三方应用没有它，调不动本 provider。
+            · android:grantUriPermissions="true"
+              用户在选择器里选中某个文件后，系统要靠它把该 Uri 的读/写
+              授权转给目标应用。
+            · intent-filter 的 DOCUMENTS_PROVIDER 动作
+              这是系统发现 DocumentsProvider 的唯一方式，少了它 provider
+              注册得再对也不会出现在任何根列表里。
+
+            authorities 用 ${applicationId}：与 ContainerDocumentsProvider
+            里的 AUTHORITY_SUFFIX（".documents"）必须拼得出同一个值。
+        -->
+        <provider
+            android:name=".ContainerDocumentsProvider"
+            android:authorities="${applicationId}.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
         </provider>
 
         <!--

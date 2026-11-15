@@ -4,22 +4,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -42,12 +36,11 @@ enum class DownloadTab(val label: String) {
     DSH("dsh下载"),
     MODPACK("整合包下载"),
     PLUGIN("插件下载"),
-    SKILL("skill下载"),
-    MCP("mcp下载");
+    SKILL("skill下载");
 
     companion object {
         /** 按显示顺序排列。不用 `entries`，兼容老一些的 Kotlin 编译器。 */
-        val all: List<DownloadTab> = listOf(DSH, MODPACK, PLUGIN, SKILL, MCP)
+        val all: List<DownloadTab> = listOf(DSH, MODPACK, PLUGIN, SKILL)
     }
 }
 
@@ -101,40 +94,31 @@ fun DownloadTabBar(selected: DownloadTab, onSelect: (DownloadTab) -> Unit) {
 }
 
 /**
- * 整合包 / 插件 / skill / mcp 页（版式照 FCL 的 `page_download.xml`）。
+ * 整合包下载页。
  *
- * ```
- * ┌────────────┬─────────────────────────────────────────┐
- * │ 名称        │                                         │
- * │ [搜索框]    │        尚未接入下载源（暂无数据）         │
- * │ 下载源      │                                         │
- * │ [Modrinth▾] │                                         │
- * │ 游戏版本    │                                         │
- * │ [1.21.1 ▾] │                                         │
- * │ [搜索]      │                                         │
- * └────────────┴─────────────────────────────────────────┘
- * ```
+ * ## 为什么这里只有「导入本地包」
  *
- * ## 为什么右侧是空的
+ * 这一页历史上试过两种东西，都删掉了：
  *
- * 这四个页签**没有**接后端，之前用内置示例数据把列表填满，
- * 看上去像真有内容，点进去却什么都装不了 —— 反而误导人。
- * 所以示例列表、翻页条、以及「安装整合包 / 导出整合包」这些
- * 走不通的按钮全部去掉，只留左侧筛选栏（它们本身也没数据源，
- * 但保留了 FCL 的版式），右侧明确写「尚未接入」。
+ * 1. **网络列表**（搜索框 + 下载源 + 游戏版本）——背后从来没有接过后端，
+ *    点「搜索」只能弹一句「尚未接入」。假按钮比空页面更误导人。
+ * 2. **方案（Plan）**——一段文本描述「装哪个 dsh + 哪些插件 + 哪些技能」，
+ *    由启动器逐项匹配后统一下载。它的根本问题是：
+ *    - 匹配要跨三个源（npm registry / 插件市场索引 / SkillHub），
+ *      任一源不可达就整项跳过，用户看到的是「一片跳过」；
+ *    - 装出来的实例与手动安装的不是同一条路径，profile 清单要靠猜，
+ *      反复出现过「插件全部消失」「实例无法启动」；
+ *    - 每次修都得重新下一遍引擎才能验证，代价太高。
  *
- * 真接后端时在这里放列表即可，左侧筛选栏一行都不用动。
+ * 现在回到最朴素的形态：**只保留已经稳定可用的本地包导入**。
+ * 引擎从「dsh下载」页装，插件从「插件下载」页装，skill 从「skill下载」页装，
+ * 各自独立、各自可验证 —— 不再有一条横跨三者的脆弱链路。
  */
 @Composable
 fun DownloadBrowseTab(
-    tab: DownloadTab,
     onPickLocalFile: () -> Unit
 ) {
-    val context = LocalContext.current
     val wide = LocalConfiguration.current.screenWidthDp >= 600
-
-    // 每个页签各自记住自己的筛选条件：切页签回来还是原样
-    var query by remember(tab) { mutableStateOf("") }
 
     Row(
         modifier = Modifier
@@ -142,106 +126,59 @@ fun DownloadBrowseTab(
             .padding(12.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // ── 左侧筛选栏 ────────────────────────────────────────────────
+        // ── 左栏：入口 ────────────────────────────────────────────────
         Column(
             modifier = Modifier
                 .width(if (wide) 200.dp else 148.dp)
                 .fillMaxHeight()
                 .verticalScroll(rememberScrollState())
         ) {
-            FclCard(modifier = Modifier.fillMaxWidth()) {
-                Text(
-                    text = "名称",
-                    color = Fcl.TextPrimary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                SearchField(value = query, placeholder = "支持中英文搜索", onChange = { query = it })
-
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    text = "下载源",
-                    color = Fcl.TextPrimary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                // 所有页签都用同一个索引源（dshopen），不做选择。
-                // 原来整合包页还挂着 Modrinth / CurseForge 两个下拉项 ——
-                // 它们既没有对应的拉取实现，也和 dsh 的插件生态无关，已按需求去掉。
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(6.dp),
-                    color = Fcl.Track
-                ) {
-                    Text(
-                        text = DSHOPEN_INDEX,
-                        color = Fcl.TextSecondary,
-                        fontSize = 9.sp,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
-                    )
-                }
-
-                // 「游戏版本 / 适配 dsh 版本」下拉已按需求去掉：
-                // 这几页都还没接后端，一个不能真正筛出东西的版本选择器
-                // 只会让人以为功能已经可用。
+            FclSettingSection("本地")
+            FclSettingRow(
+                label = "导入本地包",
+                description = "从本地 zip 安装，包结构要求与网络安装一致。",
+                shape = RowShape.SINGLE,
+                onClick = onPickLocalFile
+            ) {
+                Text(text = "选择文件", color = Fcl.ThemeText, fontSize = 12.sp)
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
-
-            // 只留「搜索」。原先这里还有「安装整合包」—— 它背后没有下载源，
-            // 点下去只能弹一句「尚未接入」，属于假按钮，已按需求去掉。
-            FclFillButton(text = "搜索") {
-                toast(context, "搜索「$query」（尚未接入下载源）")
-            }
-
-            // ── 导入本地（从 dsh 页签搬过来的一条）──────────────────────
-            // 需求要求把它从 dsh 下载页挪到整合包下载页，所以只在整合包页签出现。
-            // 对应的「导出本地」已按需求去掉：导出对普通用户没有意义，
-            // 而且要遍历上万个引擎文件，卡顿还容易失败。
-            if (tab == DownloadTab.MODPACK) {
-                Spacer(modifier = Modifier.height(10.dp))
-                FclSettingRow(
-                    label = "导入本地",
-                    description = "从本地 zip 安装，包结构要求与网络安装一致。",
-                    shape = RowShape.SINGLE,
-                    onClick = onPickLocalFile
-                ) {
-                    Text(text = "选择文件", color = Fcl.ThemeText, fontSize = 12.sp)
-                }
-            }
+            Spacer(modifier = Modifier.height(10.dp))
         }
 
-        // ── 右侧内容区 ────────────────────────────────────────────────
-        // 这块以前是一屏示例条目 + 翻页条。示例数据看着像真内容，
-        // 点进去却什么也装不了，所以整块换成明确的空态。
+        // ── 右栏：说明 ────────────────────────────────────────────────
         Column(
-            modifier = Modifier.fillMaxHeight().weight(1f),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
         ) {
-            Text(
-                text = "尚未接入下载源",
-                color = Fcl.TextSecondary,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = when (tab) {
-                    DownloadTab.MODPACK -> "整合包列表还在开发中。要装本地包，用左侧「导入本地」。"
-                    DownloadTab.PLUGIN -> "插件列表还在开发中。"
-                    DownloadTab.SKILL -> "skill 列表还在开发中。"
-                    DownloadTab.MCP -> "mcp 列表还在开发中。"
-                    DownloadTab.DSH -> "请到 dsh 下载页签安装引擎。"
-                },
-                color = Fcl.TextTertiary,
-                fontSize = 10.sp,
-                lineHeight = 15.sp
-            )
+            FclSettingSection("说明")
+
+            FclSettingRow(
+                label = "引擎、插件、技能分开装",
+                description = "引擎在「dsh下载」页装，插件在「插件下载」页装，" +
+                    "skill 在「skill下载」页装。每次只做一件事，出问题也只看一处。",
+                shape = RowShape.TOP
+            ) {
+                Text(text = "推荐", color = Fcl.Success, fontSize = 10.sp)
+            }
+
+            FclSettingRow(
+                label = "关于本地包",
+                description = "本地包就是别人用「实例设置 → 导出整合包」打好的 zip，" +
+                    "含引擎本体与依赖闭包。装完后到「实例设置」里切换实例即可使用。",
+                shape = RowShape.MIDDLE
+            ) { }
+
+            FclSettingRow(
+                label = "没有在线列表",
+                description = "这一页不再从网络拉取整合包列表 —— 没有可用的索引源，" +
+                    "摆一个搜不出东西的搜索框只会误导。",
+                shape = RowShape.BOTTOM
+            ) { }
+
+            Spacer(modifier = Modifier.height(10.dp))
         }
     }
 }
@@ -250,47 +187,9 @@ fun DownloadBrowseTab(
 // 小组件
 // ----------------------------------------------------------------------
 
-/** 下划线风格的搜索框（FCL 的 `FCLEditText` 没有边框，只有一条底线）。 */
-@Composable
-private fun SearchField(value: String, placeholder: String, onChange: (String) -> Unit) {
-    Column {
-        BasicTextField(
-            value = value,
-            onValueChange = onChange,
-            singleLine = true,
-            textStyle = TextStyle(color = Fcl.TextPrimary, fontSize = 12.sp),
-            cursorBrush = SolidColor(Fcl.Theme),
-            modifier = Modifier.fillMaxWidth(),
-            decorationBox = { inner ->
-                Box {
-                    if (value.isEmpty()) {
-                        Text(text = placeholder, color = Fcl.TextTertiary, fontSize = 12.sp)
-                    }
-                    inner()
-                }
-            }
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-        HorizontalDivider(color = Fcl.Line)
-    }
-}
-
-/** 主题色实心按钮（FCL 的 `FCLButton` 默认样式：填满宽度、白字、8dp 圆角）。 */
-@Composable
-private fun FclFillButton(text: String, onClick: () -> Unit) {
-    Surface(
-        modifier = Modifier.fillMaxWidth().fclClickable { onClick() },
-        shape = RoundedCornerShape(Fcl.Radius),
-        color = Fcl.Theme
-    ) {
-        Box(
-            modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(text = text, color = Color.White, fontSize = 13.sp)
-        }
-    }
-}
+// `SearchField` / `FclFillButton` 已删除：它们只服务于整合包页原来那套
+// 「搜索框 + 下载源」UI，那套 UI 在改成「方案」页时整块去掉了
+// （网络列表从来没接过后端，搜索只能弹一句「尚未接入」）。
 
 // ----------------------------------------------------------------------
 // 页签默认值
@@ -308,20 +207,24 @@ const val DSHOPEN_INDEX = "https://dshopen.org/index.json"
 // 预览（仅用于 IDE 里看版式，不参与运行）
 // ----------------------------------------------------------------------
 
+/**
+ * 整合包页的版式预览。
+ *
+ * 高度特意取 420dp —— 这是启动器锁横屏后单块面板的近似可用高度。
+ * 留这个预览是为了**在 IDE 里一眼看出**内容有没有把什么东西挤出可视区。
+ */
 @androidx.compose.ui.tooling.preview.Preview(widthDp = 900, heightDp = 420)
 @Composable
-private fun PreviewModpack() {
+private fun PreviewModpackPage() {
     FclTheme {
         Surface(color = Fcl.Bg, modifier = Modifier.fillMaxSize()) {
             Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
                 DownloadTabBar(selected = DownloadTab.MODPACK, onSelect = {})
-                DownloadBrowseTab(DownloadTab.MODPACK, onPickLocalFile = {})
+                DownloadBrowseTab(onPickLocalFile = {})
             }
         }
     }
 }
 
-/** 占位页的点击反馈：明确告诉用户这里还没接功能，而不是静默无响应。 */
-private fun toast(context: android.content.Context, text: String) {
-    android.widget.Toast.makeText(context, text, android.widget.Toast.LENGTH_SHORT).show()
-}
+// `toast(context, text)` 已删除：它只被原来那套「搜索」按钮用来弹
+// 「尚未接入下载源」，那套 UI 已经整块去掉。

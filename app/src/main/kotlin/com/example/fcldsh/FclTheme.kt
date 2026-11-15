@@ -11,9 +11,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -379,15 +381,39 @@ fun FclSettingRow(
                     .padding(vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // ★ 标题必须带 weight，否则它会挤掉右侧按钮 ★
+                //
+                // 原来这里没有 weight，而 trailing 那一行带 `weight(1f)`。
+                // Row 先测**不带权重**的子项，且给的是整行宽度：标题一旦很长
+                // （插件包名、会话标题、文件名都可能是几十个字符），它就把宽度
+                // 全部吃满，随后 trailing 只能分到 0 —— 表现为「行尾的按钮
+                // 整排消失」，而且最容易没的是最后一个（删除）。
+                //
+                // 改成标题 `weight(1f)` + trailing 按内容宽度：
+                // 按钮先测出自己的固有宽度并被完整保留，标题再拿剩下的空间
+                // 并在其中省略号截断。这才是「按钮永远可见、文字让位」的正确顺序。
+                //
+                // `maxLines = 1` 与 `Ellipsis` 必须保留：没有它们，标题会换行，
+                // 行高被撑高，一屏能看到的条目数就不可预测了。
                 Text(
                     text = label,
                     color = Fcl.TextPrimary,
                     fontSize = 14.sp,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
+                // 与按钮之间留一点间隙，避免省略号紧贴第一个按钮。
+                // 无条件加：`trailing` 是函数类型，没法判断「里面是不是空」，
+                // 而且多出的 8dp 只在内容完全为空时让文字少显示几个字，无害。
+                Spacer(modifier = Modifier.width(8.dp))
                 Row(
-                    modifier = Modifier.weight(1f),
+                    // ★ 去掉 weight ★
+                    //
+                    // 有 weight 时它会去抢「剩余空间」，而 Remaining 已经被上面的
+                    // 标题按 weight 分走 —— 两个权重子项会把空间对半分，
+                    // 那又不是我们要的（短标题也会白占一半宽度）。
+                    // 按内容宽度测量，靠标题的 weight 把它顶到行尾即可。
                     horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically,
                     content = trailing

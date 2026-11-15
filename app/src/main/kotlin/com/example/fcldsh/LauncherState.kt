@@ -30,7 +30,9 @@ enum class LauncherPanel(val title: String) {
     DOWNLOAD("下载中心"),
     SETTINGS("设置"),
     LOG("运行日志"),
-    ACCOUNT("用户")
+    ACCOUNT("用户"),
+    FILES("文件浏览器"),
+    TERMINAL("终端")
 }
 
 /**
@@ -168,6 +170,12 @@ class LauncherState {
         if (logs.size > MAX_LOG_LINES) {
             logs.removeRange(0, logs.size - MAX_LOG_LINES)
         }
+        // 同时镜像到「终端」面板：需求是「在终端能看到启动器打出的启动命令」。
+        // 终端没开时这一步是空操作（内部先判断有没有会话），不产生任何开销。
+        //
+        // 放在这里而不是各处调用点：启动器所有对外可见的动作都走 log()，
+        // 漏一处就会出现「某个操作在日志里有、在终端里没有」的怪现象。
+        TerminalSession.mirror(msg)
     }
 
     /** 日志面板的「清空」：只清 UI 侧记录，不影响已 fork 的 Node 进程。 */
@@ -183,6 +191,12 @@ class LauncherState {
     fun reset() {
         url = null
         runState = RunState.STOPPED
+        // 上一轮的模型调用流水不能再出现在下一次启动的悬浮窗里：
+        // 引擎进程已经没了，那些「点按 / 读屏」记录指向的是不存在的会话。
+        ModelCallFeed.clear()
+        // 状态机也归零：否则下次启动时 lastActivityAt 还是上一轮的时刻，
+        // 悬浮窗会先显示一会儿「正在思考」再跳回「暂无输出」。
+        AgentActivity.reset()
     }
 
     private companion object {

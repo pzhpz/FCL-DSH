@@ -190,6 +190,12 @@ object DshEngineDownloader {
                         phase = Phase.ERROR
                         message = "内置容器解压失败，无法导入"
                     }
+                    // ★ 早退必须自己清 busy ★
+                    // 这个分支以前直接 return@Thread，跳过了末尾的 busy = false，
+                    // 于是 busy 永久为 true：之后每一次导入都在开头的
+                    // `if (busy) return` 处静默返回 —— 用户看到的现象就是
+                    // 「确认名字后什么都没发生」，而且重启应用之前再也装不进去。
+                    busy = false
                     return@Thread
                 }
                 post { message = "容器就绪，正在导入 $label…" }

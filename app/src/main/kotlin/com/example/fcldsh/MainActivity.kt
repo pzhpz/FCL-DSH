@@ -423,51 +423,36 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-    // ── MCP 的导入导出 ──────────────────────────────────────────────
+    // MCP 的导入导出已随「mcp 下载页」一起移除：
+    // 现在 mcp 管理是**与实例无关的配置剪贴板**（见 ConfigClipboard），
+    // 直接存文本，不再读写实例目录里的配置文件，所以不需要打包/解包那套管线。
 
-    private val mcpExportLauncher =
+    // ── 文件浏览器：导出单个文件 / 目录 ──────────────────────────────
+
+    /**
+     * 待导出的文件或目录。
+     *
+     * 必须经字段带过 SAF 回调：`launch()` 是异步的，lambda 捕获的栈在
+     * 回调触发时早已不存在（与 skill / 插件导出同一条规则）。
+     */
+    private var pendingFileExport: java.io.File? = null
+
+    private val singleFileExportLauncher =
         registerForActivityResult(
             ActivityResultContracts.CreateDocument("application/zip")
         ) { uri: Uri? ->
-            if (uri == null) {
-                ui.log("❌ 未选择 MCP 导出位置")
-                return@registerForActivityResult
-            }
-            exportToUri(uri, "正在导出 MCP") { out ->
-                PluginSessionTransfer.exportMcp(this, out)
-            }
-        }
-
-    private val mcpImportLauncher =
-        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-            if (uri == null) {
-                ui.log("❌ 未选择 MCP 包")
-                return@registerForActivityResult
-            }
-            importFromUri(uri, "正在导入 MCP") { input ->
-                PluginSessionTransfer.importMcp(this, input)
-            }
-        }
-
-    /** 待导出的 MCP 配置：相对 `DSH_HOME` 的路径。 */
-    private var pendingMcpExport: String? = null
-
-    private val singleMcpExportLauncher =
-        registerForActivityResult(
-            ActivityResultContracts.CreateDocument("application/zip")
-        ) { uri: Uri? ->
-            val rel = pendingMcpExport
-            pendingMcpExport = null
+            val src = pendingFileExport
+            pendingFileExport = null
             if (uri == null) {
                 ui.log("❌ 未选择导出位置")
                 return@registerForActivityResult
             }
-            if (rel == null) {
-                ui.log("❌ 没有指定要导出的 MCP 配置")
+            if (src == null) {
+                ui.log("❌ 没有指定要导出的文件")
                 return@registerForActivityResult
             }
-            exportToUri(uri, "正在导出 MCP") { out ->
-                PluginSessionTransfer.exportMcpConfig(this, out, rel)
+            exportToUri(uri, "正在导出 ${src.name}") { out ->
+                exportFileTo(out, src)
             }
         }
 
@@ -739,6 +724,10 @@ class MainActivity : ComponentActivity() {
         // 回调只装一次：状态写进 AppState，两个 Activity 共享
         AppState.installRunnerCallbacks()
 
+        // 前后台监听：应用完全退到后台时拉起任务悬浮窗（设置里开启且已授权才生效）。
+        // 挂在这里是幂等的，四个 Activity 里任一个先起来都会装上。
+        AppState.installBackgroundWatcher(this)
+
         // 无障碍桥接（127.0.0.1 HTTP）：让 dsh 的 agent 能用 curl 读屏与点击。
         // 幂等，无障碍服务那边也会调一次（系统可能只为了绑定服务而重启进程）。
         // 端口与 token 写在 ~/a11y-bridge.json，agent 直接 cat 就能拿到。
@@ -1009,12 +998,23 @@ class MainActivity : ComponentActivity() {
             ui.openPanel(LauncherPanel.INSTANCE)
         })
 
-        // 3) 下载中心。openPanel 会直接顶掉当前面板，不需要先关再开。
+        // 3) 文件浏览器 —— 容器家目录（`filesDir/home`）的可视化管理。
+        // 隐藏项默认折叠，核心目录不给删除，详见 FileBrowserPanel 的注释。
+        rail.addView(makeRailIcon(resources.getIdentifier("ic_rail_folder", "drawable", packageName), railW) {
+            ui.openPanel(LauncherPanel.FILES)
+        })
+
+        // 4) 终端 —— 容器 shell + 启动器日志镜像。
+        rail.addView(makeRailIcon(resources.getIdentifier("ic_rail_terminal", "drawable", packageName), railW) {
+            ui.openPanel(LauncherPanel.TERMINAL)
+        })
+
+        // 5) 下载中心。openPanel 会直接顶掉当前面板，不需要先关再开。
         rail.addView(makeRailIcon(resources.getIdentifier("ic_rail_download", "drawable", packageName), railW) {
             ui.openPanel(LauncherPanel.DOWNLOAD)
         })
 
-        // 4) 启动器设置（选项卡：启动器设置 / dsh 窗口 / 权限设置 / 关于）
+        // 6) 启动器设置（选项卡：启动器设置 / dsh 窗口 / 权限设置 / 关于）
         //
         // 这里原先有一个「多人游戏」占位图标，点下去只弹一句「暂未实现」。
         // 正式版不留假按钮：功能不做就干脆不摆出来，否则用户会以为是自己
@@ -1693,14 +1693,6 @@ class MainActivity : ComponentActivity() {
                         // lambda 捕获的栈在回调触发时早已不存在。
                         pendingSkillExport = id to label
                         singleSkillExportLauncher.launch("skill-$id.zip")
-                    },
-                    onExportMcp = { mcpExportLauncher.launch("dsh-mcp.zip") },
-                    onImportMcp = { mcpImportLauncher.launch("application/zip") },
-                    onExportMcpConfig = { rel ->
-                        pendingMcpExport = rel
-                        singleMcpExportLauncher.launch(
-                            "mcp-" + rel.substringAfterLast('/') + ".zip"
-                        )
                     }
                 )
             }
@@ -1730,14 +1722,6 @@ class MainActivity : ComponentActivity() {
                         // lambda 捕获的栈在回调触发时早已不存在。
                         pendingSkillExport = id to label
                         singleSkillExportLauncher.launch("skill-$id.zip")
-                    },
-                    onExportMcp = { mcpExportLauncher.launch("dsh-mcp.zip") },
-                    onImportMcp = { mcpImportLauncher.launch("application/zip") },
-                    onExportMcpConfig = { rel ->
-                        pendingMcpExport = rel
-                        singleMcpExportLauncher.launch(
-                            "mcp-" + rel.substringAfterLast('/') + ".zip"
-                        )
                     }
                 )
             }
@@ -1765,10 +1749,7 @@ class MainActivity : ComponentActivity() {
         onExportSession: (String) -> Unit,
         onExportSkills: () -> Unit,
         onImportSkills: () -> Unit,
-        onExportSkill: (String, String) -> Unit,
-        onExportMcp: () -> Unit,
-        onImportMcp: () -> Unit,
-        onExportMcpConfig: (String) -> Unit
+        onExportSkill: (String, String) -> Unit
     ) {
         Box(
             modifier = Modifier
@@ -1794,10 +1775,7 @@ class MainActivity : ComponentActivity() {
                     onExportSession = onExportSession,
                     onExportSkills = onExportSkills,
                     onImportSkills = onImportSkills,
-                    onExportSkill = onExportSkill,
-                    onExportMcp = onExportMcp,
-                    onImportMcp = onImportMcp,
-                    onExportMcpConfig = onExportMcpConfig
+                    onExportSkill = onExportSkill
                 )
 
                 LauncherPanel.DOWNLOAD -> DownloadPanel(
@@ -1812,6 +1790,18 @@ class MainActivity : ComponentActivity() {
 
                 // 用户（密钥）管理：由主页右上角的头像区点开
                 LauncherPanel.ACCOUNT -> AccountPanel()
+
+                // 文件浏览器：家目录可视化管理。导出走 Activity 的 SAF launcher
+                // （面板只交出 File，不碰 Intent）。
+                LauncherPanel.FILES -> FileBrowserPanel(
+                    onExport = { f ->
+                        pendingFileExport = f
+                        singleFileExportLauncher.launch(f.name + ".zip")
+                    }
+                )
+
+                // 终端：容器 shell + 启动器日志镜像。
+                LauncherPanel.TERMINAL -> TerminalPanel()
 
                 LauncherPanel.NONE -> Unit
             }
@@ -1970,9 +1960,16 @@ class MainActivity : ComponentActivity() {
         // 打开面板先与磁盘对齐一次（别处可能改过指针）
         LaunchedEffect(Unit) { state.refreshEngineVersion(context) }
 
-        // 安装流程结束（在下载中心里装的）后，回到这里能立刻看到新状态
-        LaunchedEffect(EngineInstaller.installPhase) {
-            if (EngineInstaller.installPhase == EngineInstaller.InstallPhase.DONE) {
+        // 安装流程结束（在下载中心里装的）后，回到这里能立刻看到新状态。
+        //
+        // ★ 必须同时盯住**两个**安装器 ★
+        // 「网络下载」走 EngineInstaller，「导入本地整合包」走 DshEngineDownloader。
+        // 早先这里只挂了前者，于是导入本地整合包装完后面板不重扫、主页卡片
+        // 也停在旧实例上 —— 明明文件已经落盘，看起来却像「导入没生效」。
+        LaunchedEffect(EngineInstaller.installPhase, DshEngineDownloader.phase) {
+            val netDone = EngineInstaller.installPhase == EngineInstaller.InstallPhase.DONE
+            val localDone = DshEngineDownloader.phase == DshEngineDownloader.Phase.DONE
+            if (netDone || localDone) {
                 tick++
                 state.refreshEngineVersion(context)
             }
@@ -2247,6 +2244,16 @@ class MainActivity : ComponentActivity() {
         // 见 LauncherPrefs.getForceUnsupportedEngine 的注释。
         var forceUnsupported by remember {
             mutableStateOf(LauncherPrefs.getForceUnsupportedEngine(context))
+        }
+
+        // 「任务悬浮窗」开关（权限设置页）。
+        //
+        // 与上面几项不同的是：它有两道门槛 —— 应用内开关（这里）+ 系统
+        // 悬浮窗权限（permEntries 里那一项）。点这一行时先看权限在不在，
+        // 没有就直接把用户送去系统设置页，而不是把开关拨成「开」却什么都
+        // 不显示（那种「开了没反应」最难排查）。
+        var taskOverlay by remember {
+            mutableStateOf(LauncherPrefs.getTaskOverlay(context))
         }
         // 选项卡：0 启动器设置 / 1 权限设置 / 2 关于
         var tab by remember { mutableStateOf(0) }
@@ -2685,7 +2692,11 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Text(
                                 text = "${dshZoom.toInt()}%",
-                                color = if (dshZoom.toInt() == 100) Fcl.TextSecondary
+                                // 非默认值时用主题色提醒「这里被改动过」，
+                                // 默认值本身走 LauncherPrefs.DEFAULT_ZOOM，
+                                // 别在这里写死字面量。
+                                color = if (dshZoom.toInt() == LauncherPrefs.DEFAULT_ZOOM)
+                                    Fcl.TextSecondary
                                 else Fcl.ThemeText,
                                 fontSize = 12.sp
                             )
@@ -2702,7 +2713,8 @@ class MainActivity : ComponentActivity() {
                                 valueRange = LauncherPrefs.MIN_ZOOM.toFloat()..
                                     LauncherPrefs.MAX_ZOOM.toFloat(),
                                 // 步进 5%（50→200 共 30 档，steps 是中间档数）：
-                                // 连续滑块很难精确停在 100，而 100 是最需要能回得去的值。
+                                // 连续滑块很难精确停在某个整数值，而默认值 75
+                                // （LauncherPrefs.DEFAULT_ZOOM）必须能一格一格回得去。
                                 steps = 29,
                                 onValueChange = { dshZoom = it },
                                 onValueChangeFinished = {
@@ -2923,6 +2935,75 @@ class MainActivity : ComponentActivity() {
 
                         Spacer(modifier = Modifier.height(8.dp))
 
+                        // ── 任务悬浮窗 ──────────────────────────────────────
+                        //
+                        // 单独一组放在「特殊权限」之上：它有一个应用内的开关，
+                        // 而下面那组全是纯系统权限、没有应用内状态。
+                        // 混在一起会让人以为拨了系统开关就等于开了浮窗。
+                        FclSettingSection("任务悬浮窗")
+                        val overlayEntry = permEntries.firstOrNull { it.key == "overlay" }
+                        // 注意：`==` 必须与上一行同一个表达式里。
+                        // 把它写在下一行开头会让 Kotlin 解析器报 Syntax error ——
+                        // 上一行 `overlayEntry?.status` 已经是完整表达式，语句在那里就结束了。
+                        val overlayGranted =
+                            overlayEntry?.status == PermissionCenter.Status.GRANTED
+                        FclSettingRow(
+                            label = "后台显示任务悬浮窗",
+                            description = "dsh 运行期间应用退到后台时，在屏幕上留一块固定尺寸的小卡片，" +
+                                "顶部状态槽显示 agent 的状态：暂无输出 / 正在思考（转圈动画）/ " +
+                                "调用工具；下方列出正在执行的命令。拖动可移开，" +
+                                "右上角 ↩ 回到启动器，✕ 暂时收起（下次切到后台会恢复）。" +
+                                "dsh 未启动时不会显示。" +
+                                "需要先授予系统「显示在其他应用上层」权限。",
+                            shape = RowShape.SINGLE,
+                            onClick = {
+                                if (!overlayGranted) {
+                                    // 没权限就让开关保持关闭，并直接把用户送到
+                                    // 系统那一页 —— 送回本页后再拨一次开关即可。
+                                    PermissionCenter.openSafely(
+                                        this@MainActivity, overlayEntry?.open
+                                    )
+                                    ui.log(
+                                        "🔓 请打开「显示在其他应用上层」权限，" +
+                                            "返回后即可开启任务悬浮窗"
+                                    )
+                                } else {
+                                    taskOverlay = !taskOverlay
+                                    LauncherPrefs.setTaskOverlay(context, taskOverlay)
+                                    if (!taskOverlay) {
+                                        TaskOverlay.hide()
+                                    } else {
+                                        // 重新武装「缺权限」提示：这次已授权，
+                                        // 若以后权限又被系统收回，还能再提醒一次。
+                                        TaskOverlay.resetPermissionWarning()
+                                    }
+                                    ui.log(
+                                        if (taskOverlay) {
+                                            "🪟 任务悬浮窗已开启：退到后台即会出现"
+                                        } else {
+                                            "🪟 任务悬浮窗已关闭"
+                                        }
+                                    )
+                                }
+                            }
+                        ) {
+                            Text(
+                                text = when {
+                                    !overlayGranted -> "去授权"
+                                    taskOverlay -> "已开启"
+                                    else -> "已关闭"
+                                },
+                                color = when {
+                                    !overlayGranted -> Fcl.Warning
+                                    taskOverlay -> Fcl.Success
+                                    else -> Fcl.TextTertiary
+                                },
+                                fontSize = 11.sp
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
                         // ── 权限中心 ────────────────────────────────────────
                         FclSettingSection("特殊权限")
                         permEntries.forEachIndexed { i, entry ->
@@ -2993,29 +3074,87 @@ class MainActivity : ComponentActivity() {
                     }
 
                     if (tab == 3) {
+                        // 许可证弹窗开关。放在这个分支里而不是页面级：
+                        // 离开「关于」页它就该关掉，没有跨页签保留的必要。
+                        var showLicense by remember { mutableStateOf(false) }
+
+                        /**
+                         * 打开外部链接。
+                         *
+                         * 占位符期间**不跳转**，而是明确提示作者还没填 ——
+                         * 一个跳不进去的链接比「还没填」更容易误导用户，
+                         * 他们会以为项目被删了或换地方了。
+                         *
+                         * 用 `runCatching` 兜住 ActivityNotFoundException：
+                         * 部分精简 ROM 没有任何浏览器，直接 startActivity 会崩。
+                         */
+                        val openExternal: (String) -> Unit = { url ->
+                            if (ProjectInfo.repoUrlIsPlaceholder && url.contains("REPLACE_ME")) {
+                                hint("仓库地址未填写，请先改 ProjectInfo.REPO_URL")
+                            } else {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    )
+                                }.onFailure { hint("没有能打开该链接的应用") }
+                            }
+                        }
+
                         // ── 关于 ────────────────────────────────────────────
                         //
-                        // 版本号从 PackageManager 现取，不写死在代码里：
-                        // build.gradle.kts 改版本后这里自动跟着变，
-                        // 免得发版时忘了同步、用户报 bug 时报了个旧版本号。
+                        // ★ 这里显示的是 [AppBuildInfo] 里的源码常量，不是
+                        //   `PackageManager` 读到的已安装版本 ★
+                        //
+                        // 原因见 AppBuildInfo 的注释：构建系统读 module.toml 的
+                        // 方式不稳定，`BuildConfig` 里的版本会在 21/22 之间来回跳，
+                        // 与 module.toml 写的 26 无关。若只信 PackageManager，
+                        // 界面上永远是某个历史值，用户报 bug 时报的版本也是错的。
+                        //
+                        // 已安装 APK 实际写入的版本仍取出来显示在下一条，
+                        // 两者不一致时一眼可见 —— 这比藏起来更有用。
                         val pkgInfo = remember {
                             runCatching {
                                 context.packageManager
                                     .getPackageInfo(context.packageName, 0)
                             }.getOrNull()
                         }
-                        val versionName = pkgInfo?.versionName ?: "未知"
+                        val installedName = pkgInfo?.versionName ?: "未知"
+                        val installedCode = pkgInfo?.let { info ->
+                            @Suppress("DEPRECATION")
+                            run { info.versionCode }
+                        } ?: 0
+                        val mismatch = installedName != AppBuildInfo.VERSION_NAME
 
                         FclSettingSection("应用")
                         FclSettingRow(
-                            label = "DSH Launcher",
+                            // 用常量而不是硬编码：早先这里写死 "DSH Launcher"，
+                            // 与 strings.xml 的 app_name（FCL-DSH）和仓库名都不一致。
+                            label = ProjectInfo.APP_DISPLAY_NAME,
                             description = "把 dsh 完整搬到手机上运行，界面版式参照 FCL。",
                             shape = RowShape.TOP
                         ) {
                             Text(
-                                text = "v$versionName",
+                                text = "v" + AppBuildInfo.VERSION_NAME,
                                 color = Fcl.ThemeText,
                                 fontSize = 12.sp
+                            )
+                        }
+                        FclSettingRow(
+                            label = "安装包版本",
+                            description = if (mismatch) {
+                                "与上方版本不一致：说明设备上装的还是旧包。" +
+                                    "构建系统的版本号缓存有问题，需要重启 CodeAssist " +
+                                    "让它重新读取 module.toml，或先卸载旧应用再安装。"
+                            } else {
+                                "已安装 APK 里实际写入的版本，与源码声明一致。"
+                            },
+                            shape = RowShape.MIDDLE
+                        ) {
+                            Text(
+                                text = "v$installedName ($installedCode)",
+                                color = if (mismatch) Fcl.Warning else Fcl.Success,
+                                fontSize = 11.sp
                             )
                         }
                         FclSettingRow(
@@ -3131,13 +3270,184 @@ class MainActivity : ComponentActivity() {
                         )
 
                         Spacer(modifier = Modifier.height(6.dp))
+                        FclSettingSection("开源")
+                        FclSettingRow(
+                            label = "开源协议",
+                            description = "以 ${ProjectInfo.LICENSE_NAME} 授权" +
+                                "（${ProjectInfo.LICENSE_SPDX}）。你可以自由使用、修改、" +
+                                "分发；但分发修改后的版本时，须同样以 GPL-3.0 开放源代码。" +
+                                "点这一行查看条款摘要与全文入口。",
+                            shape = RowShape.TOP,
+                            onClick = { showLicense = true }
+                        ) {
+                            Text(
+                                text = "查看",
+                                color = Fcl.Theme,
+                                fontSize = 12.sp
+                            )
+                        }
+                        FclSettingRow(
+                            label = "源代码",
+                            description = if (ProjectInfo.repoUrlIsPlaceholder) {
+                                "仓库地址尚未填写：作者需把 ProjectInfo.REPO_URL 里的 " +
+                                    "REPLACE_ME 换成真实账号/仓库名后再发布。"
+                            } else {
+                                "查看完整源码、提交问题、参与改进。" +
+                                    "发现问题请附上「运行日志」里的内容。"
+                            },
+                            shape = RowShape.MIDDLE,
+                            onClick = { openExternal(ProjectInfo.REPO_URL) }
+                        ) {
+                            Text(
+                                text = "GitHub",
+                                color = if (ProjectInfo.repoUrlIsPlaceholder) {
+                                    Fcl.Warning
+                                } else {
+                                    Fcl.Theme
+                                },
+                                fontSize = 12.sp
+                            )
+                        }
+                        FclSettingRow(
+                            label = "完全免费",
+                            description = ProjectInfo.FREE_NOTICE,
+                            shape = RowShape.BOTTOM
+                        ) {
+                            Text(
+                                text = "无收费版",
+                                color = Fcl.Success,
+                                fontSize = 11.sp
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        FclSettingSection("第三方组件")
+                        FclSettingRow(
+                            label = "开源库与运行时",
+                            description = "Jetpack Compose、Kotlin、Shizuku、XZ for Java，" +
+                                "以及随应用分发的 Node 运行时。各组件协议不同，完整清单见" +
+                                "仓库里的 THIRD_PARTY_LICENSES.md。",
+                            shape = RowShape.SINGLE,
+                            onClick = { openExternal(ProjectInfo.THIRD_PARTY_URL) }
+                        ) {
+                            Text(
+                                text = "清单",
+                                color = Fcl.Theme,
+                                fontSize = 12.sp
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
                         FclSettingSection("致谢")
                         FclSettingRow(
-                            label = "参考项目",
-                            description = "界面版式参考 Fold Craft Launcher；" +
-                                "容器与插件布局参考 Deepseek-Harness-Local-Android。",
+                            label = "Fold Craft Launcher",
+                            description = "界面版式参考 FCL：左侧竖排导航、白色圆角设置行、" +
+                                "按下缩放的反馈。只参考外观与交互，未使用其代码。",
+                            shape = RowShape.TOP
+                        )
+                        FclSettingRow(
+                            label = "DeepSeek Harness",
+                            description = "引擎本体。本应用只是它的 Android 启动器与容器，" +
+                                "不修改引擎源码。",
+                            shape = RowShape.MIDDLE
+                        )
+                        FclSettingRow(
+                            label = "Deepseek-Harness-Local-Android",
+                            description = "容器目录布局、插件与会话的组织方式参考该项目。",
+                            shape = RowShape.BOTTOM
+                        )
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        FclSettingSection("免责声明")
+                        FclSettingRow(
+                            label = "按「现状」提供",
+                            description = ProjectInfo.DISCLAIMER,
                             shape = RowShape.SINGLE
                         )
+
+                        // ── 许可证弹窗 ──────────────────────────────────────
+                        //
+                        // 不把 GPL 全文（约 35KB）塞进 APK 的字符串常量：
+                        // 那会让每次构建都多处理几万字，而且一旦与仓库里的
+                        // LICENSE 不一致，反而制造「两处真源」的问题。
+                        // 这里给条款摘要 + 两个入口（仓库全文 / 官方原文）。
+                        //
+                        // 「官方原文」这一条是保底：仓库里的 LICENSE 可能
+                        // 还没建（新建仓库常见），但 gnu.org 永远可达。
+                        if (showLicense) {
+                            AlertDialog(
+                                onDismissRequest = { showLicense = false },
+                                title = { Text("开源协议") },
+                                text = {
+                                    Column(
+                                        modifier = Modifier.verticalScroll(
+                                            rememberScrollState()
+                                        )
+                                    ) {
+                                        Text(
+                                            text = ProjectInfo.LICENSE_NAME,
+                                            color = Fcl.TextPrimary,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Text(
+                                            text = ProjectInfo.COPYRIGHT,
+                                            color = Fcl.TextSecondary,
+                                            fontSize = 12.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                        Spacer(modifier = Modifier.height(10.dp))
+                                        Text(
+                                            text = "本程序是自由软件：你可以依据自由软件" +
+                                                "基金会发布的 GNU 通用公共许可证第 3 版的" +
+                                                "条款，重新分发和/或修改它。\n\n" +
+                                                "本程序基于「希望它有用」的目的分发，" +
+                                                "但不附带任何担保，甚至不包含适销性或" +
+                                                "特定用途适用性的默示担保 —— 详见许可证全文。\n\n" +
+                                                "分发修改后的版本时，你必须同样以 GPL-3.0 " +
+                                                "提供完整源代码，并保留本版权声明。",
+                                            color = Fcl.TextSecondary,
+                                            fontSize = 12.sp,
+                                            lineHeight = 18.sp
+                                        )
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        // 仓库里的 LICENSE 目前**还不存在**
+                                        // （已用 GitHub API 确认 contents/LICENSE 返回 404）。
+                                        // 所以它只作为次要入口，并在文案里说明需要先补文件 ——
+                                        // 让用户点进去看到 GitHub 的 404 页是更糟的体验。
+                                        TextButton(
+                                            onClick = {
+                                                openExternal(ProjectInfo.LICENSE_URL_GITHUB)
+                                            }
+                                        ) {
+                                            Text(
+                                                "查看仓库中的 LICENSE 文件",
+                                                fontSize = 12.sp,
+                                                color = Fcl.TextSecondary
+                                            )
+                                        }
+                                    }
+                                },
+                                confirmButton = {
+                                    // ★ 主按钮指向 gnu.org ★
+                                    //
+                                    // 本地仓库的 LICENSE 可能还没建（新建仓库常见）、
+                                    // 也可能被改名/移动；gnu.org 的官方页面永远可达。
+                                    // 把「一定打得开」的那个放在主位置，才不至于让用户
+                                    // 点到一个 404 就以为协议信息缺失。
+                                    TextButton(onClick = {
+                                        showLicense = false
+                                        openExternal(ProjectInfo.LICENSE_URL_UPSTREAM)
+                                    }) { Text("阅读官方全文") }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showLicense = false }) {
+                                        Text("关闭")
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -3379,6 +3689,17 @@ class MainActivity : ComponentActivity() {
         // 两个安装器落盘后都会调 DSHRunner.setCurrentVersion(key)，
         // 所以 DONE 时读 currentVersion 才是准的。
         var pendingLabel by remember { mutableStateOf<String?>(null) }
+
+        // 这次待写标签是**哪个安装器**在跑：true = EngineInstaller（网络下载），
+        // false = DshEngineDownloader（导入本地整合包）。
+        //
+        // ★ 为什么必须记住来源 ★
+        // 两个安装器各有自己的 phase，而同一时刻通常**只有一个是非 IDLE**。
+        // 早先这里用「任一 phase 是 IDLE 就算放弃」，于是导入本地整合包时
+        // （下载器 = INSTALLING，EngineInstaller 始终 IDLE）刚确认的名字
+        // 当场被判成「放弃」丢掉 —— 表现就是「确认名称后名字没生效，
+        // 实例仍然叫版本号」。
+        var pendingLabelNet by remember { mutableStateOf(true) }
 
         // 安装 / 建实例之后的刷新触发器。
         //
@@ -3646,24 +3967,10 @@ class MainActivity : ComponentActivity() {
                             }
                         )
                     }
-                } else if (activeTab == DownloadTab.MCP) {
-                    // MCP 下载：本质是「注册表入口 + 导入」，理由见该面板的注释。
-                    Column(
-                        modifier = Modifier.fillMaxSize()
-                    ) {
-                        McpDownloadPanel(
-                            onImport = {
-                                mcpImportLauncher.launch("application/zip")
-                            }
-                        )
-                    }
                 } else {
-                    // 整合包：版式照 FCL 的 page_download.xml。
-                    // 右侧是空态（尚未接入下载源），假列表与假按钮已按需求去掉。
-                    DownloadBrowseTab(
-                        tab = activeTab,
-                        onPickLocalFile = onPickLocalFile
-                    )
+                    // 整合包：现在是「方案」页（不再拉网络列表）。
+                    // DSH 页签在上面有独立分支，所以走到这里的一定是 MODPACK。
+                    DownloadBrowseTab(onPickLocalFile = onPickLocalFile)
                 }
                 }
             }
@@ -3718,7 +4025,11 @@ class MainActivity : ComponentActivity() {
                 onConfirm = { label ->
                     namingVersion = null
                     namingLocal = false
-                    if (label.isNotBlank()) pendingLabel = label
+                    if (label.isNotBlank()) {
+                        pendingLabel = label
+                        // 记下这次是谁在装：下面写标签时只看这条通道的 phase
+                        pendingLabelNet = nv != null
+                    }
 
                     if (nv != null) {
                         pendingInstallVersion = nv
@@ -3751,26 +4062,38 @@ class MainActivity : ComponentActivity() {
         // 用户下次**成功**装另一个版本时，这个旧名字就会被写到那个版本上 ——
         // 表现为「装完 B，B 却叫成了 A 的名字」，且完全查不出来源。
         //
-        // 为什么把 IDLE 也算作「放弃」：设 pendingLabel 不会改变本 effect 的
-        // key（两个 phase），而两个安装器都是**同步**把 phase 置成 INSTALLING
-        // 的（在同一个点击回调内、重组之前）。所以这里看到 IDLE，只可能是
-        // 「首次组合」或「从非 IDLE 回到 IDLE（取消）」，不会误伤刚确认的那次。
+        // ★ 只看「本次安装所属」的那条通道 ★
+        //
+        // 早先这里把两个 phase 混在一起判（任一是 IDLE / ERROR 就算放弃），
+        // 而导入本地整合包时 EngineInstaller 一直停在 IDLE，于是：
+        //   点确认 → 下载器立刻进 INSTALLING → 本 effect 重跑
+        //   → 看到 EngineInstaller == IDLE → 判成「放弃」→ 名字被丢掉
+        // 结果装完的实例仍然叫版本号，用户看到的就是「确认名称后没生效」。
+        // 另一条通道的 IDLE 只说明「它没在干活」，不是放弃信号。
+        //
+        // 依然把 IDLE 当放弃，是因为两个安装器都是**同步**把 phase 置成
+        // INSTALLING 的（在同一个点击回调里、重组之前）：轮到本 effect 跑时
+        // 自己那条通道已经不可能是 IDLE，除非确实是「首次组合」或「被复位」。
         LaunchedEffect(EngineInstaller.installPhase, DshEngineDownloader.phase) {
-            val ei = EngineInstaller.installPhase
-            val di = DshEngineDownloader.phase
+            val netPhase = EngineInstaller.installPhase
+            val localPhase = DshEngineDownloader.phase
 
-            val aborted = ei == EngineInstaller.InstallPhase.ERROR ||
-                di == DshEngineDownloader.Phase.ERROR ||
-                ei == EngineInstaller.InstallPhase.IDLE ||
-                di == DshEngineDownloader.Phase.IDLE
+            val done: Boolean
+            val aborted: Boolean
+            if (pendingLabelNet) {
+                done = netPhase == EngineInstaller.InstallPhase.DONE
+                aborted = netPhase == EngineInstaller.InstallPhase.ERROR ||
+                    netPhase == EngineInstaller.InstallPhase.IDLE
+            } else {
+                done = localPhase == DshEngineDownloader.Phase.DONE
+                aborted = localPhase == DshEngineDownloader.Phase.ERROR ||
+                    localPhase == DshEngineDownloader.Phase.IDLE
+            }
             if (aborted) {
                 // 没有待写标签时这一步是空操作，不必额外判断
                 pendingLabel = null
                 return@LaunchedEffect
             }
-
-            val done = ei == EngineInstaller.InstallPhase.DONE ||
-                di == DshEngineDownloader.Phase.DONE
             if (!done) return@LaunchedEffect
 
             val label = pendingLabel ?: return@LaunchedEffect
@@ -4706,6 +5029,27 @@ class MainActivity : ComponentActivity() {
     private fun startInstance() {
         ui.runState = RunState.STARTING
         ui.log("⏳ 准备运行时…")
+        // 每次启动都清掉上一轮的悬浮窗流水与状态机。
+        //
+        // 只在 reset()（停止时）清是不够的：进程被系统杀掉、或上次异常退出时
+        // 走不到那条路径，残留的 lastToolAt 会让新引擎一启动就显示「正在思考」。
+        ModelCallFeed.clear()
+        AgentActivity.reset()
+
+        // ★ 这里曾经有一处 WebView 预热，已删除 ★
+        //
+        // 当时的假设是：`WebView(this)` 进程内首次实例化要 1～2 秒（Chromium
+        // provider 冷启动），所以趁引擎在后台启动的空档先把它做了。
+        //
+        // 实测证伪了两点：
+        // 1. 实例化只要 **15～18ms**，不是 1～2 秒 —— 收益本来就不存在；
+        // 2. 预热在 postDelayed(60ms) 就启动，正好**和 Node 加载模块并发**，
+        //    而 Chromium provider 要拉独立进程、占几百 MB 内存，跟 Node 抢
+        //    CPU 与内存。实测引擎自举从 11.5s 涨到 15.7s。
+        //
+        // 结论：为一个 18ms 的开销去和 9 秒的模块加载抢资源，完全不划算。
+        // 删掉后启动路径恢复原样。详见 AGENT_NOTES.md §7。
+
         Thread {
             // 1) 内置容器
             if (!DSHRunner.ensureRuntime(this)) {

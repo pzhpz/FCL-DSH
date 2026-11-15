@@ -434,6 +434,7 @@ fun PluginDownloadPanel() {
             page = page,
             pageCount = ((PluginDownloader.entries.size + PLUGIN_PAGE_SIZE - 1) /
                 PLUGIN_PAGE_SIZE).coerceAtLeast(1),
+            perPage = PLUGIN_PAGE_SIZE,
             onDismiss = { jumpDialog = false },
             onJump = { target ->
                 page = target
@@ -490,7 +491,7 @@ private fun shortDesc(raw: String): String {
  * 「3 / 56」这种文本挤在等宽格里会被省略成「3 /…」。
  */
 @Composable
-private fun PageBar(
+internal fun PageBar(
     page: Int,
     pageCount: Int,
     onJump: () -> Unit,
@@ -550,7 +551,7 @@ private fun PageBar(
 
 /** 分页条里的一格。禁用时不挂手势（真点不动，不是点了没反应）。 */
 @Composable
-private fun RowScope.BarButton(
+internal fun RowScope.BarButton(
     text: String,
     enabled: Boolean,
     weight: Float = 1f,
@@ -592,9 +593,16 @@ private fun RowScope.BarButton(
  * 让用户输 999 直接报错不如给他最后一页，反正他想要的是「往后翻到底」。
  */
 @Composable
-private fun JumpPageDialog(
+internal fun JumpPageDialog(
     page: Int,
     pageCount: Int,
+    /**
+     * 每页条数，只用于副标题那句「每页 N 个」。
+     *
+     * 必须由调用方传入而不是读常量：插件页每页 10 条、skill 页每页 20 条，
+     * 写死任一个都会在另一处显示错误的数字。
+     */
+    perPage: Int,
     onDismiss: () -> Unit,
     onJump: (Int) -> Unit
 ) {
@@ -618,7 +626,7 @@ private fun JumpPageDialog(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "共 $pageCount 页，每页 $PLUGIN_PAGE_SIZE 个",
+                    text = "共 $pageCount 页，每页 $perPage 个",
                     color = Fcl.TextTertiary,
                     fontSize = 10.sp
                 )

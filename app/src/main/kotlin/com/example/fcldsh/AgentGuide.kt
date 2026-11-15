@@ -228,6 +228,148 @@ object AgentGuide {
         ¦该应用提供了「**截图** + 读屏 + 模拟点击」能力，并已把它包装成 PATH 上的
         ¦`a11y` 命令 —— 不需要 root，不需要 Shizuku，也不需要自己找端口或 token。
         ¦
+        ¦
+        ¦## ★★★ 先读这一节：容器里的程序不能直接执行 ★★★
+        ¦
+        ¦**裸敲 `node` / `npm` / `bash` / `python3` 一律 `Permission denied`。**
+        ¦
+        ¦这不是装坏了，是 SELinux 的 W^X 策略：本应用 `targetSdk >= 29`，
+        ¦落在 `untrusted_app_29` 域，该域**禁止对应用数据目录里的文件 `execve`**。
+        ¦
+        ¦两种正确姿势，按目标类型选一个：
+        ¦
+        ¦| 目标 | 正确写法 |
+        ¦|---|---|
+        ¦| **ELF 二进制**（`node`、`rg`、`bash` 等） | `/system/bin/linker64 "<文件>" 参数…` |
+        ¦| **shell 脚本**（`a11y`、`bin/npm` 这类包装脚本） | `sh "<文件>" 参数…` |
+        ¦
+        ¦**为什么这样能绕过**：真正被 `execve` 的是 `/system/bin` 里的
+        ¦`linker64` 或 `sh`（系统文件，允许执行），你要跑的程序只是它们的
+        ¦**参数** —— argv 是数据，不是执行目标。
+        ¦
+        ¦三条必须记住的推论：
+        ¦
+        ¦- **改 shebang 没用**。内核在读到 shebang **之前**就已经拒绝了执行请求，
+        ¦  把 `#!/usr/bin/env node` 换成任何别的路径都不解决问题。
+        ¦- **只有 `execve` 受限，`dlopen` 不受限**。所以预编译的 `.node`
+        ¦  原生模块（如 `sharp`）能正常加载 —— 这在装包时很关键。
+        ¦- **PATH 上确实有 `node` / `npm`**（容器自带），但它们指向需要
+        ¦  linker64 加载的文件，直接调用必然失败。
+        ¦
+        ¦### 照抄这两条就够用
+        ¦
+        ¦```bash
+        ¦# 跑 node
+        ¦/system/bin/linker64 "${'$'}PREFIX/bin/node" -e 'console.log(process.version)'
+        ¦
+        ¦# 跑 npm（npm 的入口是 JS 文件，不是 ELF）
+        ¦/system/bin/linker64 "${'$'}PREFIX/bin/node" \
+        ¦  "${'$'}PREFIX/lib/node_modules/npm/bin/npm-cli.js" --version
+        ¦```
+        ¦
+        ¦`${'$'}PREFIX` 是容器根（`.../files/usr`），`${'$'}HOME` 是工作根，
+        ¦`${'$'}DSH_HOME` 是当前实例的数据目录。
+        ¦
+        ¦## ★★★ 装软件包：能装什么、不能装什么（全部实测）★★★
+        ¦
+        ¦**一句话结论**：两条路 ——
+        ¦1. **`pkg` 命令**：装容器仓库里的包（`ffmpeg` / `jq` / `git` / `python`
+        ¦   这类命令行工具走这里，这是**唯一**可行的途径）；
+        ¦2. **npm**：装**纯 JS** 包。
+        ¦
+        ¦其余（apt/dpkg、pip、网上下载的二进制、需要现编原生模块的包）
+        ¦**全都装不了**，别在它们身上浪费轮次。
+        ¦
+        ¦### 通道实测结果
+        ¦
+        ¦| 通道 | 能不能 | 依据 |
+        ¦|---|---|---|
+        ¦| **npm** | ✅ **能用（要绕）** | npm 12.2.2；`install is-number` → `added 1 package in 4s`，随后 `require()` 返回 `true` |
+        ¦| **yarn** | ✅ | corepack 拉起 yarn 1.22.22 |
+        ¦| **预编译 `.node` 原生插件** | ✅ | `sharp` 加载成功（`vips 8.18.7`）—— `dlopen` 不受 W^X 限制 |
+        ¦| **`pkg` 命令** | ✅ **可用（绕行实现）** | 应用自己实现：Kotlin 解 ar/tar/xz，不依赖 dpkg。见下方「装命令行工具」 |
+        ¦| **apt / dpkg** | ❌ 不存在 | `bin/pkg` 原本是坏掉的 Termux 残留脚本（它 source 的路径不存在）。装真 dpkg 也无用 —— 它要 exec postinst，被 W^X 拦 |
+        ¦| **pip / python 包** | ❌ | 有 `python3.14`，但 **stdlib 是残的**：`lib/python3.14` 只有 98 个条目，`threading.py`、`os.py` 都不在 → 连启动都 `Fatal Python error`；`pip` / `ensurepip` 也没有 |
+        ¦| **原生编译**（gcc/clang/make/cmake） | ❌ | 一个都没有，C 扩展没法现编 |
+        ¦| **pnpm** | ❌ | corepack 下载的 `pnpm-native` → `spawnSync … EACCES`；改用 npm 装 JS 版 pnpm，一启动就抛错退出（它仍要 spawn 原生二进制） |
+        ¦| **网上下载的二进制工具** | ❌ | 下下来也**跑不了**：应用数据目录 `execve` 被拦；`/data/local/tmp` 不可写（实测 `Permission denied`） |
+        ¦
+        ¦网络和磁盘**没问题**：npmjs / pypi / debian / 清华镜像全部可访问，
+        ¦`${'$'}PREFIX` 可写，磁盘还有十几 G。
+        ¦**卡住的是执行与工具链，不是网络。** 所以「下不下来」和「跑不跑得了」
+        ¦是两件事，别看到下载成功就以为能用了。
+        ¦
+        ¦### 装命令行工具（ffmpeg / jq / git / python…）：用 `pkg`
+        ¦
+        ¦容器里有一个**应用自己实现的** `pkg` 命令。它不是 apt/dpkg —— 它直接
+        ¦解 `.deb`（应用内部用 Kotlin 解 ar/tar/xz），因此绕开了 W^X 与
+        ¦「Termux 前缀被编译死」两个死结。
+        ¦
+        ¦```bash
+        ¦pkg install ffmpeg        # 连依赖一起装
+        ¦pkg search 视频            # 搜仓库（第一次要下几 MB 索引）
+        ¦pkg list                  # 已装
+        ¦pkg remove ffmpeg         # 卸载
+        ¦```
+        ¦
+        ¦装完**直接敲命令名**（如 `ffmpeg -version`）：新命令会被自动包装成
+        ¦同名 shell 函数（内部经 linker64 加载）。若当前终端还看不到，重开一次终端。
+        ¦
+        ¦必须知道的边界：
+        ¦
+        ¦- **只装 Termux 仓库（`packages.termux.dev`）的包**。Debian 官方源的包是
+        ¦  glibc 构建，本机 libc 是 bionic，装了也跑不了。
+        ¦- **没有 apt/dpkg**，`pkg` 自己维护安装清单
+        ¦  （`${'$'}PREFIX/etc/fcl-pkgs.json`），`pkg remove` 按它删文件。
+        ¦- **第一次 `pkg search` / `pkg install` 要下载几 MB 索引**，进度慢是正常的，
+        ¦  不要以为卡死了就中断。
+        ¦- **前缀被编译进代码的包**（python、perl）靠应用自动注入的
+        ¦  `PYTHONHOME` / `PERL5LIB` 兜底；若仍报找不到 stdlib，那是包本身的问题，
+        ¦  如实转告用户，不要反复重装。
+        ¦- `pkg` 必须在**应用进程活着**时用（它经 127.0.0.1 的本地服务干活）。
+        ¦  若报「鉴权失败」，重开一次终端即可。
+        ¦
+        ¦### 装纯 JS 包（npm，照抄）
+        ¦
+        ¦```bash
+        ¦# 装。--ignore-scripts 不能省，原因见下面的雷 1
+        ¦/system/bin/linker64 "${'$'}PREFIX/bin/node" \
+        ¦  "${'$'}PREFIX/lib/node_modules/npm/bin/npm-cli.js" \
+        ¦  install <包名> --ignore-scripts
+        ¦
+        ¦# 验证真的能用 —— 装完**必须**跑一次，不要只看 "added N packages"
+        ¦/system/bin/linker64 "${'$'}PREFIX/bin/node" -e \
+        ¦  'const x=require("<包名>"); console.log(typeof x)'
+        ¦```
+        ¦
+        ¦### 三个会坑死人的雷
+        ¦
+        ¦1. **`npm install` 必须加 `--ignore-scripts`**。
+        ¦   生命周期脚本（postinstall 等）会挂：子进程的默认 shell 被编译死成
+        ¦   `/data/data/com.termux/files/usr/bin/sh`，那个路径在本机不存在，
+        ¦   实测 `execSync("node -v")` 直接 `ENOENT`。
+        ¦   带 postinstall 的包会「装成功但是半成品」，所以宁可不跑脚本。
+        ¦2. **要 spawn 自己二进制的包一律装不动**：`pnpm`、`esbuild` 这类。
+        ¦   判断方法：看 `package.json` 的 `bin` 字段是否指向原生可执行文件，
+        ¦   或代码里有没有 `spawn` / `execFile` 自己的二进制。**纯 JS 的才行**。
+        ¦3. **装完 `require` 不到**：确认你用的是
+        ¦   `linker64 "${'$'}PREFIX/bin/node"`，并且 cwd 或 `NODE_PATH`
+        ¦   能让它找到 `node_modules`（默认在 `${'$'}PREFIX/lib/node_modules`）。
+        ¦
+        ¦### 想装一个 CLI 工具时，按这个顺序判断
+        ¦
+        ¦1. 是 npm 上的**纯 JS** 包吗？→ 大概率能装，直接上
+        ¦2. 有 `postinstall` 或需要 node-gyp 编译吗？→ 加 `--ignore-scripts` 试；
+        ¦   如果**必须**现编原生模块 → 装不了
+        ¦3. 是**预编译好的** `.node` 吗？→ 能加载（`dlopen` 不受限）
+        ¦4. 需要 spawn 自己的可执行文件吗？→ 装不了
+        ¦5. 是系统包 / python 包 / deb 包吗？→ 装不了
+        ¦6. 是网上下载的 ELF 工具吗？→ **一定跑不了**，别下载
+        ¦
+        ¦需要一个命令行工具时，**先找有没有等价的 npm 纯 JS 包**（这是唯一可能
+        ¦走通的路）；找不到就如实告诉用户「这个工具在当前环境装不了」，
+        ¦不要换个路径再试一遍 —— 那是同一个限制。
+        ¦
         ¦$priv
         ¦
         ¦## 快速开始
@@ -238,22 +380,13 @@ object AgentGuide {
         ¦
         ¦返回 `"service":"connected"` 才说明可用；`disconnected` 表示无障碍服务没开。
         ¦
-        ¦### 如果直接敲 `a11y` 报 Permission denied
-        ¦
-        ¦改用 `sh` 显式执行：
+        ¦`a11y` 是容器里的 shell 脚本，所以**默认不能直接敲 `a11y`**
+        ¦（`Permission denied` 属预期，原理见本文开头的「执行铁律」）。改用：
         ¦
         ¦```bash
         ¦sh "${'$'}PREFIX/bin/a11y" status
         ¦sh "${'$'}PREFIX/bin/a11y" shot
         ¦```
-        ¦
-        ¦原因是 SELinux 禁止对**应用数据目录里的文件**执行 `execve`（W^X）。
-        ¦这一限制**无法通过改 shebang 绕过** —— 内核在读到 shebang 之前就已经拒绝了
-        ¦执行请求，所以把 `#!/system/bin/sh` 换成任何别的路径都没用。
-        ¦而 `sh <脚本>` 能工作，因为此时 `sh` 是把脚本当**数据**打开并解释执行的，
-        ¦走的是读权限而不是执行权限。
-        ¦
-        ¦这与本环境里 `node` 必须用 `/system/bin/linker64 <node>` 加载是同一个限制。
         ¦
         ¦$conn
         ¦
@@ -526,6 +659,39 @@ object AgentGuide {
         ¦无障碍服务**（系统只在服务重新绑定时读取能力声明）。这时应当把 `fix` 转告
         ¦用户，而不是反复重试。`errorCode=3` 只是调用太频繁，`sleep 0.5` 再试即可。
         ¦
+        ¦## 给 dsh 加 MCP 服务器（默认位置就是补丁层，别去装插件）
+        ¦
+        ¦**先看这一条**：dsh 的 `web` profile **自带** `mcp-manager` 插件。
+        ¦加一个 MCP 服务器**不需要**装任何插件、**不需要** `mcp.json`，
+        ¦只要往 profile 的补丁层追加一条配置：
+        ¦
+        ¦```yaml
+        ¦# ${'$'}DSH_HOME/profiles/web/cordis.patch.yml
+        ¦- target: '@deepseek-ai/dsh-mcp-manager'
+        ¦  serverName: <你自己起的名字>
+        ¦  type: streamable-http          # 或 stdio
+        ¦  url: http://127.0.0.1:8787/mcp # streamable-http 时用
+        ¦  # command: /path/to/server    # stdio 时改用这一行
+        ¦```
+        ¦
+        ¦几条硬规则：
+        ¦
+        ¦- **写完不用重启**，`mcp-manager` 会热加载；
+        ¦- 服务器在对话里暴露的工具名格式是 `mcp__<serverName>__<toolName>`；
+        ¦- 补丁层是**共享文件**，里面还躺着主题、快捷键、其它插件的配置：
+        ¦  只**追加**自己那一条，不要整份覆写，也不要「整理」别人的段落；
+        ¦- 别再去 `local-plugins/` 里搭 bundle —— 那是给「自带 server 脚本的
+        ¦  连接器插件」用的形态，普通 MCP 服务器用不到，绕这一圈纯属浪费轮次。
+        ¦
+        ¦写完后验证（不要靠猜）：
+        ¦
+        ¦```bash
+        ¦cat "${'$'}DSH_HOME/profiles/web/cordis.patch.yml"   # 确认自己那条在
+        ¦```
+        ¦
+        ¦`${'$'}DSH_HOME` 就是当前实例的数据目录（见 `~/AGENTS.md` 顶部）。
+        ¦若 `profiles/web/cordis.patch.yml` 不存在，直接创建它即可。
+        ¦
         ¦## 已知做不到（不要在这些上浪费轮次）
         ¦
         ¦- $crossAppShell
@@ -535,6 +701,8 @@ object AgentGuide {
         ¦- **录屏**：本应用没有实现录屏。
         ¦- **读屏可能不全**：WebView、Flutter 等自绘界面的部分内容在无障碍树里缺失。
         ¦  这种界面优先用 `a11y shot` 看图，而不是依赖 `a11y tree`。
+        ¦- **apt / dpkg / pip**：本机**没有**这些东西，别试。装包只有两条路 ——
+        ¦  `pkg`（容器仓库）和 npm（纯 JS 包），见本文开头的「装软件包」一节。
         ¦
         ¦## 安全
         ¦

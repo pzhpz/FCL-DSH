@@ -354,7 +354,29 @@ object PluginDownloader {
      *
      * 全程在后台线程，进度写进 [installMessage]。
      */
-    fun install(context: Context, entry: Entry, wantVersion: String? = null) {
+    fun install(
+        context: Context,
+        entry: Entry,
+        wantVersion: String? = null,
+        /**
+         * 装完后是否立刻把这个包登记进 profile 清单
+         * （`dependencies` + `dsh.profile.bundles`）。
+         *
+         * ## 为什么需要这个开关
+         *
+         * **dsh 在监听 `profiles/web/package.json`**，一次写入就是一次热重载。
+         * 逐个装 6 个插件 = 写 6 次 = 热重载 6 次 —— 用户看到的就是
+         * 「过一会儿冒出来一个插件，再一会儿又一个」。
+         *
+         * 方案（[PlanSpec.run]）因此传 `false`：先把插件全装完，最后调一次
+         * [PluginSessionTransfer.registerPlugins] 统一写盘。dsh 只热重载一次，
+         * 所有插件同时出现。
+         *
+         * 单装一个插件（插件下载页点「安装」）保持默认 `true`：
+         * 那种场景只装一个，立刻生效才是对的。
+         */
+        registerToProfile: Boolean = true
+    ) {
         if (installBusy) return
         installBusy = true
         installingPkg = entry.pkg
@@ -435,10 +457,24 @@ object PluginDownloader {
                     return@Thread
                 }
 
-                // 登记到 profile 清单：少了这一步，文件在磁盘上但引擎不会加载。
-                // 与「导入插件包」共用同一份实现，避免两处规则分叉。
-                val pairs = done.map { it.key to it.value }
-                val registered = PluginSessionTransfer.registerPlugins(context, pairs)
+                // ★ 只登记用户点的那个包，**不登记依赖** ★
+                //
+                // `done` 里包含整棵依赖闭包（下载器会递归拉 dependencies）。
+                // 早先这里是 `done.map { ... }` 全量登记，后果是依赖包也被写进
+                // `dsh.profile.bundles`，引擎会把它们当成独立插件逐个加载 ——
+                // 用户看到的就是「装一个插件，冒出一堆没要的插件」，而且其中
+                // 几个还会因为找不到所需服务而卡在 pending。
+                //
+                // 依赖只需要躺在 node_modules 里被 require 到，不该出现在
+                // 「加载清单」中。这两件事完全不同。
+                val rootVer = done[entry.pkg]
+                val pairs = if (rootVer != null) listOf(entry.pkg to rootVer) else emptyList()
+                // 方案批量安装时这里不登记，留给 PlanSpec 最后统一写一次
+                val registered = if (registerToProfile && pairs.isNotEmpty()) {
+                    PluginSessionTransfer.registerPlugins(context, pairs)
+                } else {
+                    0
+                }
                 ok = true
 
                 val deps = done.size - 1
@@ -446,7 +482,10 @@ object PluginDownloader {
                     append("✅ 已安装 ${entry.display}")
                     if (!done[entry.pkg].isNullOrBlank()) append(" ${done[entry.pkg]}")
                     if (deps > 0) append("（含 $deps 个依赖）")
-                    if (registered > 0) append("，已登记 $registered 个")
+                    when {
+                        registered > 0 -> append("，已登记 $registered 个")
+                        !registerToProfile -> append("，稍后统一登记")
+                    }
                 }
                 DSHRunner.onLog(msg)
                 DSHRunner.onLog("ℹ️ 重启实例后插件才会加载")

@@ -1,6 +1,9 @@
 package com.example.fcldsh
 
 import android.content.Context
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 
 /**
  * 版本显示名（用户起的标签）—— **纯 UI 层，不碰任何磁盘目录名**。
@@ -35,6 +38,23 @@ object VersionLabels {
     private const val FILE = "version_labels"
 
     /**
+     * 修订号：标签表每变一次就 +1。
+     *
+     * ## 为什么需要它
+     *
+     * 标签存在 SharedPreferences 里，而 [displayName] 是个**普通函数** ——
+     * Compose 不会因为它背后的文件变了而重组。于是「装完整合包、名字写进去了，
+     * 界面上还是旧名字」这种情况会**持续到下一次碰巧重组**（切页签、返回等），
+     * 用户看到的就是「确认名称后没生效」。
+     *
+     * 解决办法是把修订号做成快照状态：[label] 读它，任何显示名字的地方
+     * 就自动订阅了它；[set] 改标签时 +1，所有显示点立刻重组。
+     * 比在每处调用点各自维护 `tick++` 可靠得多（那种写法漏一处就不刷新）。
+     */
+    var revision by mutableStateOf(0)
+        private set
+
+    /**
      * 标签长度上限。
      *
      * 40 是「手机上一行放得下、又够描述」的折中。版本管理小窗的标题只有一行
@@ -61,6 +81,8 @@ object VersionLabels {
 
     /** 读某版本的标签；没设过返回 null。 */
     fun label(context: Context, versionKey: String): String? {
+        // 触碰快照状态（见 [revision]）：组合期间读到这里，标签一变就会重组。
+        revision.let { }
         if (versionKey.isEmpty()) return null
         val v = runCatching { prefs(context).getString(key(versionKey), null) }.getOrNull()
         return v?.takeIf { it.isNotBlank() }
@@ -77,6 +99,8 @@ object VersionLabels {
         prefs(context).edit().apply {
             if (clean == null) remove(key(versionKey)) else putString(key(versionKey), clean)
         }.apply()
+        // 通知所有显示名字的地方重组（见 [revision]）
+        revision++
         return clean
     }
 

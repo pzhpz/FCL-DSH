@@ -20,6 +20,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.FileProvider
+import com.DSHRunner
 import java.io.File
 import kotlin.math.abs
 
@@ -76,13 +77,16 @@ class DshWebActivity : ComponentActivity() {
     private lateinit var webView: WebView
 
     /**
-     * 本次窗口的缩放百分比（50..200）。
+     * 本次窗口的缩放百分比（50..200，默认 [LauncherPrefs.DEFAULT_ZOOM]）。
      *
      * 在 [onCreate] 里从偏好读一次并缓存：`applyViewport()` 会在**每次**
      * onPageFinished 时被调用，每次都去读 SharedPreferences 既浪费也容易
      * 在一次会话中途读到不一致的值。
+     *
+     * 初值也走同一个常量：`applyWindowSettings()` 万一没跑到（异常早退），
+     * 这里不会退化成一个和设置页对不上的数字。
      */
-    private var zoomPercent = 100
+    private var zoomPercent = LauncherPrefs.DEFAULT_ZOOM
 
     /**
      * 应用「设置 → dsh 窗口」里的方向与缩放偏好。
@@ -203,7 +207,21 @@ class DshWebActivity : ComponentActivity() {
         applyWindowSettings()
 
         val root = FrameLayout(this)
+
+        // 计时：这一句是实例化 WebView 的真实开销。
+        //
+        // 这个数字曾经推翻了一个错误假设：当初为了「省下 Chromium 冷启动的
+        // 1～2 秒」，在引擎启动期间做 WebView 预热（见 MainActivity 里的注释）。
+        // 实测这里是 **15～18ms**，根本没有那 1～2 秒，预热纯属白做 ——
+        // 还因为和 Node 加载模块并发抢资源，把引擎自举拖慢了 4 秒。
+        //
+        // 保留这行计时：以后若有人说「WebView 打开慢」，先看这个数字。
+        val tWebView = android.os.SystemClock.elapsedRealtime()
         webView = WebView(this)
+        AppState.launcher.log(
+            "⏱ WebView 实例化: ${android.os.SystemClock.elapsedRealtime() - tWebView}ms"
+        )
+
         setupWebView()
         root.addView(
             webView,
@@ -631,6 +649,25 @@ class DshWebActivity : ComponentActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 Log.d(TAG, "onPageFinished: $url")
+                // 只在第一次报耗时：重定向 / iframe / applyViewport 触发的重绘
+                // 都会再走一遍这里，重复打印只会让日志变噪。
+                if (!loadTimingLogged && tLoadStarted > 0L) {
+                    loadTimingLogged = true
+                    AppState.launcher.log(
+                        "⏱ 页面加载完成（loadUrl → onPageFinished）: " +
+                            "${android.os.SystemClock.elapsedRealtime() - tLoadStarted}ms"
+                    )
+                }
+                // 页面真正显示出来了：启动阶段攒下的诊断现在才开始跑
+                // （见 DSHRunner.deferDiag / runDeferredDiagnostics）。
+                //
+                // 放在 onPageFinished 而不是「引擎吐出 dsh web:」的时刻：
+                // 那时 WebView 还在建、页面还要加载，绝不是抢磁盘和 CPU 的时机。
+                // 这里才是「用户已经在用界面」的第一个时刻。
+                //
+                // 幂等：onPageFinished 会因重定向/iframe/缩放重绘多次触发，
+                // runDeferredDiagnostics 内部只放行第一次。
+                runCatching { DSHRunner.notePageLoaded() }
                 // 主动改写 viewport meta，并丢弃旧栅格重绘一次（见 applyViewport）
                 view?.let { v ->
                     applyViewport(v)
@@ -760,9 +797,26 @@ class DshWebActivity : ComponentActivity() {
      * dsh 里依赖 height:100% 的根容器解析成 0，之后即使 View 被测量成
      * 1080x1917，页面布局也不会自动恢复 —— 屏幕只剩 body 的白底。
      */
+    /**
+     * 开始 loadUrl 的时刻，用于统计「页面加载完」的真实耗时。
+     *
+     * 0 表示还没开始加载。放在字段里是因为要把时间从
+     * [loadWhenSized] 传到 [WebViewClient.onPageFinished]，两者不在同一个作用域。
+     */
+    private var tLoadStarted = 0L
+
+    /**
+     * 页面加载完成的耗时只报一次。
+     *
+     * `onPageFinished` 会因重定向、iframe、以及 applyViewport 触发的重绘
+     * 被多次调用；重复打印只会让日志变噪，也让读者误以为加载了多次。
+     */
+    private var loadTimingLogged = false
+
     private fun loadWhenSized(url: String, attempt: Int = 0) {
         if (webView.width > 0 && webView.height > 0) {
             Log.d(TAG, "loadUrl after size ${webView.width}x${webView.height}")
+            tLoadStarted = android.os.SystemClock.elapsedRealtime()
             webView.loadUrl(url)
             enterImmersive()
             return
@@ -770,6 +824,7 @@ class DshWebActivity : ComponentActivity() {
         if (attempt >= 50) {
             // 兜底：约 3 秒仍未拿到尺寸就照常加载，避免永远卡住
             Log.w(TAG, "loadUrl without size ${webView.width}x${webView.height}")
+            tLoadStarted = android.os.SystemClock.elapsedRealtime()
             webView.loadUrl(url)
             enterImmersive()
             return
@@ -785,7 +840,8 @@ class DshWebActivity : ComponentActivity() {
      * 切到软件层会强制丢弃全部缓存栅格并整页重绘，再切回默认恢复硬件合成。
      */
     private fun applyViewport(view: WebView) {
-        // 缩放比例由「设置 → dsh 窗口」决定，默认 100（即 initial-scale=1）。
+        // 缩放比例由「设置 → dsh 窗口」决定，默认 75
+        // （[LauncherPrefs.DEFAULT_ZOOM]，即 initial-scale=0.75）。
         //
         // 为什么把同一个值同时写进 initial/minimum/maximum：
         //  · 只写 initial 的话，用户双指一捏就能把页面缩到别的比例，

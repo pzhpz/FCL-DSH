@@ -138,6 +138,7 @@ object LauncherPrefs {
     private const val KEY_FORCE_UNSUPPORTED = "force_unsupported_engine"
     private const val KEY_EXIT_BTN_X = "web_exit_btn_x"
     private const val KEY_EXIT_BTN_Y = "web_exit_btn_y"
+    private const val KEY_TASK_OVERLAY = "task_overlay"
 
     /**
      * dsh 引擎下载地址的默认值。
@@ -330,13 +331,13 @@ object LauncherPrefs {
     }
 
     /**
-     * 读取 dsh 窗口的缩放百分比（50..200，默认 100）。
+     * 读取 dsh 窗口的缩放百分比（50..200，默认 75）。
      *
      * 越界值一律夹回区间：手改偏好文件或旧版本遗留值不该让页面缩到看不见。
      */
     fun getDshZoom(context: Context): Int {
         val sp = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-        return sp.getInt(KEY_DSH_ZOOM, 100).coerceIn(MIN_ZOOM, MAX_ZOOM)
+        return sp.getInt(KEY_DSH_ZOOM, DEFAULT_ZOOM).coerceIn(MIN_ZOOM, MAX_ZOOM)
     }
 
     /** 写入 dsh 窗口的缩放百分比。下次打开窗口时生效。 */
@@ -350,6 +351,18 @@ object LauncherPrefs {
     /** 缩放百分比的合法范围。上限 200 已足够看清小字，再大只会剩几个字。 */
     const val MIN_ZOOM = 50
     const val MAX_ZOOM = 200
+
+    /**
+     * 默认缩放 75%。
+     *
+     * 100% 是按桌面 DPI 排版的观感 —— 手机屏幕窄，dsh 页面在 100% 下一屏
+     * 只放得下很少内容。75% 既不用左右拖动，字也仍然清楚。
+     *
+     * ★ 这个常量是**唯一**的默认值来源 ★
+     * [getDshZoom] 的缺省参数、设置页里「是否已改动」的高亮判断、
+     * DshWebActivity 的初始值都引用它，别再各写一个字面量 100/75。
+     */
+    const val DEFAULT_ZOOM = 75
 
     // ── 主题设置（纯 UI 偏好，不影响 dsh 进程的任何行为）──────────────
 
@@ -393,6 +406,37 @@ object LauncherPrefs {
         context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
             .edit()
             .putFloat(KEY_THEME_ALPHA, alpha.coerceIn(0f, 1f))
+            .apply()
+    }
+
+    // ── 任务悬浮窗 ──────────────────────────────────────────────────
+
+    /**
+     * 是否在应用退到后台时显示任务悬浮窗。默认 **关**。
+     *
+     * ## 为什么默认关
+     *
+     * 悬浮窗会盖在**别的应用**上面（包括用户正在读的文档、正在操作的银行页面）。
+     * 不请自来地往别人屏幕上挂一块东西是侵入性的，本启动器已有的
+     * 「所有文件访问」「无障碍」「屏幕截图」全是默认关 + 显式引导，
+     * 这一项保持一致。
+     *
+     * 另外它需要 `SYSTEM_ALERT_WINDOW` 这个特殊权限，而这个权限
+     * 只能由用户到系统设置页手动打开 —— 默认开等于让用户每次切后台
+     * 都撞一次「添加失败」。
+     *
+     * 真正的显示判定见 [TaskOverlay.sync]：偏好只是三个条件之一。
+     */
+    fun getTaskOverlay(context: Context): Boolean {
+        val sp = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+        return sp.getBoolean(KEY_TASK_OVERLAY, false)
+    }
+
+    /** 写入任务悬浮窗开关。 */
+    fun setTaskOverlay(context: Context, on: Boolean) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_TASK_OVERLAY, on)
             .apply()
     }
 }

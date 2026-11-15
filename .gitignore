@@ -7,3 +7,7 @@ local.properties
 *.jks
 *.keystore
 .DS_Store
+
+# Node 运行时二进制包：体积过大，不纳入版本控制。
+# 构建前需自行放入该路径（详见 README「从源码构建」）。
+app/src/main/assets/runtime.zip

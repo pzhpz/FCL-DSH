@@ -1089,7 +1089,12 @@ object PluginSessionTransfer {
     /**
      * 导出**单个** MCP 配置。
      *
-     * @param rel 相对 `DSH_HOME` 的路径（UI 侧 [McpConfig.rel]）。
+     * @param rel 相对 `DSH_HOME` 的路径。
+     *
+     * ⚠️ UI 侧的 MCP 扫描（`McpConfig` / `scanMcpConfigs`）已在 1.4.x 删除 ——
+     * 「mcp 管理」改成与实例无关的配置便签（[ConfigClipboard]）后，界面不再
+     * 列实例里的配置文件。这两个导出入口因此**当前没有调用点**，
+     * 保留只是为了以后接「从实例里挑一个配置导出」。不要再往它们上面加新功能。
      *
      * 若这个配置在 `local-plugins/<包>/` 里，会把**同目录下的所有文件**
      * 一起打包（`cordis.patch.yml` + `mcp-server.mjs` + `launch-mcp.sh`）——

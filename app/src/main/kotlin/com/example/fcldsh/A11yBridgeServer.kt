@@ -373,7 +373,22 @@ object A11yBridgeServer {
                 return
             }
 
-            val body = route(path, query)
+            // 工具调用前后各打一次卡：悬浮窗据此区分「调用工具」与「思考」
+            // （见 [AgentActivity] 的类注释）。必须包在 try/finally 里 ——
+            // 路由抛异常时若不 endTool，状态会永远停在「调用工具」。
+            val isTool = isModelTool(path)
+            if (isTool) AgentActivity.beginTool()
+            val body = try {
+                route(path, query)
+            } finally {
+                if (isTool) AgentActivity.endTool()
+            }
+
+            // 记一条「模型调用」流水，供任务悬浮窗在用户切到别的应用时显示。
+            // 放在这里（唯一的 HTTP 出口）而不是各分支里：新增端点时不会漏记，
+            // 而且 401/405 这类根本没走路由的请求不会被误记成模型动作。
+            // 全程 runCatching：记流水失败绝不能让请求本身失败。
+            runCatching { recordModelCall(path, query, body) }
             respond(client.getOutputStream(), 200, body)
         } catch (e: Exception) {
             Log.w(TAG, "handle failed: ${e.message}")
@@ -984,6 +999,202 @@ object A11yBridgeServer {
             put("ageMs", ScreenCaptureState.frameAgeMs())
             put("format", "png")
         }.toString()
+    }
+
+    // ------------------------------------------------------------------
+    // 模型调用流水（供任务悬浮窗）
+    // ------------------------------------------------------------------
+
+    /**
+     * 这个端点算不算「模型调用了一次工具」。
+     *
+     * 同时决定两件事：要不要给 [AgentActivity] 打「正在调用工具」的卡，
+     * 以及要不要往 [ModelCallFeed] 记一行。两处共用同一个判定，
+     * 否则很容易出现「状态显示调用工具，但列表里没有对应那一行」。
+     *
+     * 纯探查端点（`/help`、`/status`、`/windows`）不算：它们只是环境自检，
+     * 一次任务里可能几十次，算进去会让「调用工具」这个状态失去意义。
+     */
+    private fun isModelTool(path: String): Boolean = when (path) {
+        "/screen", "/screen/text", "/screenshot",
+        "/tap", "/longPress", "/tapText", "/input",
+        "/back", "/home", "/swipe", "/drag",
+        "/window/step", "/window/restore", "/check" -> true
+
+        else -> false
+    }
+
+    /**
+     * 把一次桥接调用翻译成一行「模型在做什么」，记到 [ModelCallFeed]。
+     *
+     * ## 为什么在这里翻译，而不是让悬浮窗自己解析路径
+     *
+     * 悬浮窗只管显示，不该知道 HTTP 端点长什么样；而参数（点了哪个按钮、
+     * 输入了什么）只有这一层拿得到。所以在这唯一的出口处翻译成
+     * 「图标 + 一句话」，两端各自简单。
+     *
+     * ## 哪些调用不记
+     *
+     * `/status`、`/windows`、`/help` 是 agent 的环境探查，一次任务里可能几十次，
+     * 记进去只会把真正的点按挤出窗口。`/screen` 与 `/screenshot` 虽然也是探查，
+     * 但它们是「模型看见了什么」的关键线索，所以记 —— 靠 [ModelCallFeed] 的
+     * 连续去重压成 `👁 读屏 ×5`，不占多行。
+     *
+     * @param path 已去掉 query 的请求路径
+     * @param query 解析后的参数
+     * @param body 路由返回的 JSON（用来判断成功/失败与失败原因）
+     */
+    private fun recordModelCall(path: String, query: Map<String, String>, body: String) {
+        val json = runCatching { JSONObject(body) }.getOrNull()
+        val ok = json?.optBoolean("ok", true) ?: true
+
+        val icon: String
+        val what: String
+        when (path) {
+            "/screen", "/screen/text" -> {
+                icon = "👁"
+                what = "读屏"
+            }
+
+            "/screenshot" -> {
+                icon = "📷"
+                what = "截图"
+            }
+
+            "/tap" -> {
+                icon = "🖱"
+                what = "点按 ${pos(query)}"
+            }
+
+            "/longPress" -> {
+                icon = "🖱"
+                what = "长按 ${pos(query)}"
+            }
+
+            "/tapText" -> {
+                icon = "🖱"
+                val t = query["text"].orEmpty()
+                what = if (t.isEmpty()) "点按文字（未给文字）" else "点「${clip(t, 12)}」"
+            }
+
+            "/input" -> {
+                icon = "⌨"
+                val t = query["text"].orEmpty()
+                what = if (t.isEmpty()) "清空输入框" else "输入「${clip(t, 12)}」"
+            }
+
+            "/back" -> {
+                icon = "↩"
+                what = "返回"
+            }
+
+            "/home" -> {
+                icon = "🏠"
+                what = "回桌面"
+            }
+
+            "/swipe" -> {
+                icon = "⇢"
+                what = "滑动"
+            }
+
+            "/drag" -> {
+                icon = "✥"
+                what = "拖动窗口"
+            }
+
+            "/window/step" -> {
+                icon = "⤡"
+                what = "缩小窗口"
+            }
+
+            "/window/restore" -> {
+                icon = "⤢"
+                what = "恢复窗口"
+            }
+
+            "/check" -> {
+                icon = "🔍"
+                what = "检查遮挡"
+            }
+
+            // 纯探查端点：不记（见上面的说明）
+            else -> return
+        }
+
+        val text = if (ok) {
+            // 成功时补一句「输出」摘要（读屏读到多少项、截图多大），
+            // 这样用户看到的不只是「模型点了一下」，还有点完之后拿到了什么。
+            what + outputSummary(path, json)
+        } else {
+            // 失败时把原因带上：用户看到的「✗ 无障碍服务未开启」比一个孤零零的红叉有用
+            val reason = reasonOf(json)
+            if (reason.isEmpty()) what else "$what · ${clip(reason, 30)}"
+        }
+
+        ModelCallFeed.record(icon, text, ok)
+    }
+
+    /** `x,y` 参数压成 `(540, 1200)`；缺参数时返回空串，避免出现 `(null, null)`。 */
+    private fun pos(query: Map<String, String>): String {
+        val x = coord(query["x"])
+        val y = coord(query["y"])
+        return if (x == null || y == null) "" else "($x, $y)"
+    }
+
+    private fun coord(raw: String?): String? {
+        val v = raw?.toFloatOrNull() ?: return null
+        return v.toInt().toString()
+    }
+
+    /** 截断到 [n] 个字符，超出的用省略号。 */
+    private fun clip(s: String, n: Int): String =
+        if (s.length <= n) s else s.take(n - 1) + "…"
+
+    /**
+     * 从失败响应里取一句能给人看的原因。
+     *
+     * 参数声明成**显式可空类型**：在主流程里 `json` 已经被前面的
+     * `optBoolean` 用法窄化过，再写 `json?.` 会被分析器报
+     * 「Unnecessary safe call on a non-null receiver」。放进独立函数后
+     * 入参类型就是 `JSONObject?`，不存在这种歧义。
+     */
+    private fun reasonOf(json: JSONObject?): String =
+        json?.optString("reason").orEmpty()
+            .ifEmpty { json?.optString("error").orEmpty() }
+            .replace('\n', ' ')
+            .trim()
+
+    /**
+     * 成功响应的「输出」摘要，接在动作描述后面。
+     *
+     * 只给三个能一眼量化的端点：读屏读到了多少项、纯文本多少字、截图多大。
+     * 其它端点返回空串 —— 与其编一个没信息量的后缀，不如不加。
+     */
+    private fun outputSummary(path: String, json: JSONObject?): String {
+        if (json == null) return ""
+        return when (path) {
+            "/screen" -> {
+                val n = json.optJSONArray("nodes")?.length() ?: 0
+                if (n > 0) " · $n 项" else ""
+            }
+
+            "/screen/text" -> {
+                val t = json.optString("text")
+                if (t.isEmpty()) "" else " · ${t.length} 字"
+            }
+
+            "/screenshot" -> {
+                val b = json.optLong("bytes", 0L)
+                when {
+                    b <= 0L -> ""
+                    b >= 1024L -> " · ${b / 1024L}KB"
+                    else -> " · ${b}B"
+                }
+            }
+
+            else -> ""
+        }
     }
 
     private fun jsonOk(payload: JSONObject): String =

@@ -6,6 +6,10 @@ import android.util.Log
 import com.example.fcldsh.AccountStore
 import com.example.fcldsh.AgentGuide
 import com.example.fcldsh.DshProviderConfig
+// 本文件在 package `com` 下（目录是 com/，但包名不是 com.example.fcldsh），
+// 所以同目录 com/example/fcldsh 里的对象必须显式 import —— 少一个就是
+// 「Unresolved reference: EngineLogTap」。
+import com.example.fcldsh.EngineLogTap
 import com.example.fcldsh.FsLocalPatch
 import com.example.fcldsh.Instances
 import com.example.fcldsh.LauncherPrefs
@@ -13,9 +17,11 @@ import com.example.fcldsh.OpenSslEnv
 import com.example.fcldsh.PermissionMode
 import com.example.fcldsh.PrivMode
 import com.example.fcldsh.Privilege
+import com.example.fcldsh.PkgBridge
 import com.example.fcldsh.PtySupport
 import com.example.fcldsh.RequireBuiltinShim
 import com.example.fcldsh.SandboxBackend
+import com.example.fcldsh.SandboxExec
 import com.example.fcldsh.ShellEnvFix
 import com.example.fcldsh.ShizukuBridge
 import java.io.File
@@ -173,6 +179,116 @@ object DSHRunner {
      *    直接验证「`--os/--cpu` 到底生效没有」
      * 3. 原生模块（`.node`）—— 判断是否有需要编译的包
      */
+    /**
+     * 已经跑过引擎自检的版本号。
+     *
+     * 自检要深度 6 递归遍历整棵 `node_modules` 并读一批 `package.json`，
+     * 实测 **2.7 秒**。它只产出给人看的诊断信息，结论在同一份引擎上不会变，
+     * 所以每个 App 进程、每个版本只跑一次就够 —— 用户连点几次启动、
+     * 或者在会话里反复重启引擎时，不该反复烧这 2.7 秒。
+     *
+     * 进程重启后清空：新的一次会话重新确认一遍是合理的（用户可能中途
+     * 装了插件、换了版本），代价只是冷启动时后台线程多跑一次。
+     */
+    @Volatile
+    private var engineStateLoggedVersion: String? = null
+
+    // ------------------------------------------------------------------
+    // 延迟诊断：启动路径上不做任何「只产出日志」的活
+    // ------------------------------------------------------------------
+
+    /**
+     * 攒起来的诊断任务。**启动阶段只入队，不执行。**
+     *
+     * ## 为什么要做减法
+     *
+     * 逐段计时证明我们自己的代码只花 ~100ms，但用户明确要求「做不了加法就做减法，
+     * 检测什么的全排在后面」。这个方向本身是对的：诊断哪怕只花 1ms，它也占着
+     * 磁盘、占着 CPU，而启动那 9～15 秒里引擎正处于 I/O 饱和状态，任何额外
+     * 的读都可能被放大。
+     *
+     * 所以现在：**启动路径上一次诊断 I/O 都不做**。所有「只是打印给人看」的
+     * 内容全部入队，等页面真的显示出来之后，再用后台线程一次性跑完 ——
+     * 那时候用户已经在用界面了，诊断对感知零影响。
+     *
+     * ## 失败时立刻跑
+     *
+     * 「除非遇到问题」这一半的需求：启动失败时没有页面可等，就在
+     * [runDeferredDiagnostics] 的 `reason` 里标明原因，由进程退出路径触发。
+     * 启动失败恰恰最需要这些信息。
+     */
+    private val diagLock = Any()
+
+    private val diagTasks = ArrayList<() -> Unit>()
+
+    /** 本轮诊断是否已经跑过。每 [startNode] 复位，避免重复执行。 */
+    private var diagConsumed = false
+
+    /** 入队一个诊断任务。启动期间调用它是**零 I/O** 的（只 add 一个 lambda）。 */
+    private fun deferDiag(task: () -> Unit) {
+        synchronized(diagLock) {
+            if (!diagConsumed) diagTasks.add(task)
+        }
+    }
+
+    /** 新一轮启动：清空上一轮的任务并重新武装。 */
+    private fun resetDiag() {
+        synchronized(diagLock) {
+            diagTasks.clear()
+            diagConsumed = false
+        }
+    }
+
+    /**
+     * 把攒下的诊断在后台线程里跑掉。**幂等**，重复调用只有第一次有效。
+     *
+     * 触发点有两个（见 [notePageLoaded] 与 `startNode` 的 finally）：
+     * - 页面已就绪 —— 正常启动，此时用户已在用界面；
+     * - 进程退出 —— 启动失败，此时最需要诊断信息。
+     *
+     * @param reason 写进日志的一句话，说明为什么这时候跑
+     */
+    fun runDeferredDiagnostics(reason: String) {
+        val tasks: List<() -> Unit>
+        synchronized(diagLock) {
+            if (diagConsumed) return
+            diagConsumed = true
+            tasks = ArrayList(diagTasks)
+            diagTasks.clear()
+        }
+        if (tasks.isEmpty()) return
+
+        Thread {
+            val t0 = System.currentTimeMillis()
+            onLog("🔍 诊断（$reason，后台执行，不占启动时间）")
+            tasks.forEach { task ->
+                runCatching { task() }
+                    .onFailure { e -> onLog("⚠️ 诊断项失败: ${e.message}") }
+            }
+            onLog("⏱ 诊断完成: ${System.currentTimeMillis() - t0}ms")
+        }.apply {
+            // 守护线程：它只是诊断，不该拖住进程退出
+            isDaemon = true
+            name = "dsh-diag"
+        }.start()
+    }
+
+    /**
+     * 页面已经显示出来（由 [com.example.fcldsh.DshWebActivity] 的 onPageFinished 调用）。
+     *
+     * 这是延迟诊断的**主触发点**：此刻用户已经在用界面，磁盘与 CPU 都空出来了，
+     * 跑那几项诊断对感知零影响。
+     *
+     * 幂等 —— `onPageFinished` 会因重定向、iframe、缩放重绘多次触发，
+     * 但 [runDeferredDiagnostics] 内部只放行第一次。
+     *
+     * 不需要 `Context`：诊断任务在 [deferDiag] 入队时就已经捕获了自己需要的
+     * 上下文，这里只是扣动扳机。
+     */
+    fun notePageLoaded() {
+        runDeferredDiagnostics("页面已就绪")
+    }
+
     private fun logEngineState(context: Context) {
         // 多版本共存：先报「装了哪些、在用哪个」，再单独看当前版本的内容
         val vers = installedVersions(context)
@@ -438,6 +554,15 @@ object DSHRunner {
      *
      * @return 可用端口；连试 [maxTries] 个都占用时返回 0（调用方需处理）。
      */
+    /**
+     * 引擎默认监听端口。
+     *
+     * 引擎不认 `--port` 时（0.2.2-rc.x 全线如此），实际端口由引擎自己决定，
+     * 也就是这个值 —— 日志里必须如实这么写，不要报一个我们「挑」出来的端口
+     * （那会让人以为换端口成功了，排查时被带偏）。
+     */
+    private const val DEFAULT_PORT = 3080
+
     private fun allocatePort(start: Int = 3080, maxTries: Int = 20): Int {
         for (p in start until start + maxTries) {
             if (isPortFree(p)) return p
@@ -445,6 +570,126 @@ object DSHRunner {
         }
         return 0
     }
+
+    // ------------------------------------------------------------------
+    // CLI 参数能力探测
+    // ------------------------------------------------------------------
+
+    /**
+     * 一次扫描，拿到当前引擎**支持的全部长参数**。**离线源码扫描，不启动进程。**
+     *
+     * ## 为什么不再「一个参数一个参数地试」
+     *
+     * 之前是 `engineSupportsFlag(flag)` 单参数探测，结果是**修一个冒一个**：
+     * 先发现 `--no-open` 不支持，改完又冒出 `--host` 不支持 —— 每次都要用户
+     * 重新下一遍引擎才能验证，白烧流量。
+     *
+     * 根因是：dsh 的命令行参数集**随版本整体变化**（0.2.1 线认 `--no-open`，
+     * 0.2.2-rc.3 连 `--host` 都不认）。逐个试必然要试很多轮。
+     *
+     * 改成「一次抽出全部参数名」之后，任何版本都只需**一次启动**即可把
+     * 所有不支持的参数同时过滤掉，不会再出现「修一个、冒一个」。
+     *
+     * ## 判据
+     *
+     * 在 dsh 包自己的 `lib/` 里扫出所有 `--xxx` 形式的字符串，收进集合。
+     * 这些字符串来自 CLI 定义（`option('--host', …)` 之类），所以集合
+     * 就等价于「这个引擎认识哪些长参数」。
+     *
+     * ## 为什么不用 `dsh --help`
+     *
+     * 那要起一个完整 node 进程（`linker64` + `--expose-internals` + 补丁预加载），
+     * 耗时 1~2 秒，而且它自己也可能因为环境问题失败 —— 「探测失败」会变成
+     * 新的故障源，比不探测更糟。
+     *
+     * ## 扫描范围与开销
+     *
+     * 只扫 dsh 包自己的 `lib/`（几 MB JS），不碰整棵 node_modules。
+     * 结果按 [binJsPath] 缓存在 [flagCache] 里：一次会话只扫一次。
+     *
+     * @return 支持的长参数集合；扫不出任何东西时返回**空集**，
+     *   调用方据此把所有可选参数都丢掉（宁可少传，不可传错——传错是致命的）。
+     */
+    private fun engineSupportedFlags(binJsPath: String): Set<String> {
+        if (binJsPath.isBlank()) return emptySet()
+        flagCache[binJsPath]?.let { return it }
+
+        val binFile = File(binJsPath)
+
+        // ── 磁盘缓存 ────────────────────────────────────────────────────
+        //
+        // [flagCache] 只活在**当前进程**里。用户每次冷启动应用，这条扫描都会
+        // 重跑一遍：把 `lib/` 下所有 JS（单文件上限 4MB）读成字符串再跑正则，
+        // 累计要读几 MB 文本 —— 在「点启动 → 进程发起」这条关键路径上，
+        // 这是最容易被忽略的一块固定开销。
+        //
+        // 缓存文件放在引擎包目录下（我们本来就会往那里写 flock 替身等补丁），
+        // 用 bin.js 的 **size + mtime** 做校验：换版本、重装引擎、或解压覆盖
+        // 都会让它自动失效，不会拿着旧版本的参数集去启动新引擎。
+        val stamp = "${binFile.length()}:${binFile.lastModified()}"
+        val cacheFile = runCatching {
+            File(binFile.parentFile?.parentFile, ".launcher-flags")
+        }.getOrNull()
+
+        if (cacheFile != null) {
+            runCatching {
+                if (cacheFile.isFile) {
+                    val lines = cacheFile.readLines()
+                    if (lines.firstOrNull() == stamp) {
+                        val set = lines.drop(1).filter { it.isNotBlank() }.toHashSet()
+                        if (set.isNotEmpty()) {
+                            flagCache[binJsPath] = set
+                            return set
+                        }
+                    }
+                }
+            }
+        }
+
+        val pkgDir = runCatching { binFile.parentFile?.parentFile }.getOrNull()
+        val libDir = pkgDir?.let { File(it, "lib") }
+        val out = HashSet<String>(32)
+
+        fun scan(dir: File, depth: Int) {
+            if (depth > 4) return
+            val kids = runCatching { dir.listFiles() }.getOrNull() ?: return
+            for (f in kids) {
+                if (f.isDirectory) {
+                    scan(f, depth + 1)
+                    continue
+                }
+                // 只扫 JS：参数都在 JS 里注册
+                if (!f.name.endsWith(".js") && !f.name.endsWith(".mjs")) continue
+                // 单文件上限 4 MB：dsh 的 lib 里没有更大的单文件
+                if (f.length() > 4L * 1024 * 1024) continue
+                val text = runCatching { f.readText() }.getOrNull() ?: continue
+                FLAG_RE.findAll(text).forEach { m -> out.add(m.value) }
+            }
+        }
+        if (libDir != null && libDir.isDirectory) scan(libDir, 0)
+
+        flagCache[binJsPath] = out
+
+        // 落盘。写不进去就只是少了下次的加速，不影响本次结果。
+        if (cacheFile != null && out.isNotEmpty()) {
+            runCatching {
+                cacheFile.writeText((listOf(stamp) + out).joinToString("\n"))
+            }
+        }
+        return out
+    }
+
+    /** [engineSupportedFlags] 的缓存：同一个 `bin.js` 只扫一次。 */
+    private val flagCache = java.util.concurrent.ConcurrentHashMap<String, Set<String>>()
+
+    /**
+     * 引擎 lib 里出现的所有长参数名。
+     *
+     * 只认 `--` 开头的标识符，且要求前面不是标识符字符 —— 避免
+     * 把 `foo--bar` 这种自减表达式里的 `--bar` 也算进来。
+     * 长度上限 40 是防误吞超长字符串常量。
+     */
+    private val FLAG_RE = Regex("""(?<![A-Za-z0-9_$-])--[a-z][a-z0-9-]{1,38}""")
 
     // ------------------------------------------------------------------
     // 内置容器 / 后天下载引擎
@@ -2508,6 +2753,33 @@ object DSHRunner {
             stopProcess()
         }
         try {
+            // 新一轮启动：**先**清空上一轮的诊断队列，再往里入队。
+            //
+            // ★ 顺序不能反 ★ 这里踩过一次：最初把 resetDiag() 写在
+            // `pb.start()` 之前（也就是 deferDiag 之后），结果它把本轮刚入队的
+            // 诊断全清掉了 —— 表现是页面就绪后日志里什么都没有，而代码看起来
+            // 完全正常。凡是「先攒后跑」的队列，复位必须发生在第一次入队之前。
+            //
+            // 清空是必要的：本对象跨多次启动复用，不清会带着上一轮的 lambda，
+            // 既重复执行又捕获着旧的 context。
+            resetDiag()
+
+            // ── 启动计时 ──────────────────────────────────────────────────
+            //
+            // 「点启动 → 看到输出」要接近 10 秒，但日志里看不出时间花在哪一段：
+            // 中间有几十个串行步骤（装配 shim、探测 su、建目录、扫引擎参数、
+            // 自检沙箱…），任何一步慢都表现为「整体慢」。
+            //
+            // 这里给每个阶段打一行 `⏱`，格式是「本阶段耗时（累计）」，下次
+            // 把日志贴出来就能直接指认瓶颈，而不是靠猜。开销可忽略（几次时钟读取）。
+            val tStart = System.currentTimeMillis()
+            var tPrev = tStart
+            fun mark(label: String) {
+                val now = System.currentTimeMillis()
+                onLog("⏱ $label: ${now - tPrev}ms（累计 ${now - tStart}ms）")
+                tPrev = now
+            }
+
             val prefix = File(context.filesDir, "usr").absolutePath
             // HOME 就是 filesDir/home —— **不要改成外部存储**。
             //
@@ -2553,6 +2825,7 @@ object DSHRunner {
                 return
             }
             onLog("引擎版本: $activeVersion")
+            mark("容器与引擎校验")
 
             // 用纯 JS 实现替换 flock 的原生绑定。
             //
@@ -2620,6 +2893,7 @@ object DSHRunner {
             runCatching {
                 RequireBuiltinShim.ensure(context, onLog)
             }.onFailure { onLog("⚠️ 原生绑定替身装配失败: ${it.message}") }
+            mark("装配 shim（flock/pty/fs/shell/原生绑定）")
 
             // 原生绑定预检**不在这里**做。
             //
@@ -2676,6 +2950,7 @@ object DSHRunner {
             // 清掉迁移过程留下的临时目录（只删 .seed-tmp，绝不碰 .dsh-<ver>）
             val stale = cleanupLegacyIsolation(context)
             if (stale > 0) onLog("🧹 已清理迁移临时目录")
+            mark("数据目录与附件准备")
 
             // ★ 先把 su 探测一次，再写 agent 说明 ★
             //
@@ -2746,6 +3021,16 @@ object DSHRunner {
             // 完成，agent 不需要读 token、不需要拼 curl。AGENTS.md 里教的就是它。
             ensureA11yCli(prefix)
 
+            // 5) pkg 命令 —— 绕行实现的包管理器（不依赖 dpkg/apt）。
+            //
+            // 容器里的 bin/pkg 是坏的 Termux 残留脚本，apt/dpkg 也都没有；
+            // 这条路走的是应用内部的 TermuxPkg，经本地 HTTP + shell 函数
+            // 包成可用的 `pkg`。详见 [PkgBridge] 的类注释。
+            //
+            // 失败只记日志：pkg 是附加能力，不该阻断引擎启动。
+            runCatching { PkgBridge.ensure(context, File(prefix), onLog) }
+                .onFailure { onLog("⚠️ pkg 服务启动失败: ${it.message}") }
+
             // 使用 linker64 绕过 Android 执行限制。
             // 参数顺序有讲究：--patch 是 dsh 自己的 launcher flag，
             // 必须排在 app 的 inner flags（--no-open/--host/--port）之前，
@@ -2756,17 +3041,44 @@ object DSHRunner {
             // 在拿到真实配置键之后能一键打开。
             val useOverlay = false
 
-            // 动态分配端口：写死 3080 时，只要上次的 Node 没被彻底杀掉，
-            // 下次启动就必然撞 EADDRINUSE 导致 startup failed。
-            // 换端口能把这个死结化开，残留进程重启手机后自然消失。
-            val port = allocatePort(3080)
-            if (port == 0) {
-                onLog("❌ 3080-3099 全部被占用，无法启动")
+            // ★ 先扫引擎支持哪些参数，再决定要不要挑端口 ★
+            //
+            // 原来是「先 allocatePort(3080)，后面才 engineSupportedFlags(判断能不能传 --port)」。
+            // 真机日志有决定性证据说明这个顺序是错的：
+            //
+            //   端口 3080 已被占用，尝试下一个
+            //   监听端口: 3081
+            //   ℹ️ 引擎不支持 --port，已跳过
+            //   dsh web: http://127.0.0.1:3080/?token=…      ← 引擎照样用了 3080
+            //
+            // 也就是说引擎不认 --port 时，挑出来的 3081 只写进了 currentPort
+            // 这个变量，实际端口完全由引擎自己决定 —— 我们既白扫了最多 20 个
+            // 端口，又在日志里报了一个假端口。这个假端口还会误导后续排查
+            // （记忆里「怀疑有遗留进程占 3080」那条线就是被它带偏的）。
+            //
+            // 反过来，引擎支持 --port 时这个扫描才有价值（能绕开残留进程），
+            // 所以保留它，只是挪到知道 supported 之后。
+            val supported = engineSupportedFlags(binJsPath)
+            if (supported.isEmpty()) {
+                onLog("⚠️ 未能识别引擎参数集，本次只传必需参数（可能不开浏览器/不自定端口）")
+            }
+            mark("扫描引擎参数（${supported.size} 个）")
+
+            val wantsPort = supported.isEmpty() || "--port" in supported
+            val port = if (wantsPort) allocatePort(DEFAULT_PORT) else DEFAULT_PORT
+            if (wantsPort && port == 0) {
+                onLog("❌ $DEFAULT_PORT-${DEFAULT_PORT + 19} 全部被占用，无法启动")
                 onLog("❌ 可能有上次残留的 Node 进程，重启手机即可释放")
                 return
             }
             currentPort = port
-            onLog("监听端口: $port")
+            if (wantsPort) {
+                onLog("监听端口: $port")
+            } else {
+                // 如实说清楚：端口不是我们选的，引擎自己开在 3080。
+                onLog("监听端口: 由引擎决定（不支持 --port，通常为 $DEFAULT_PORT）")
+            }
+            mark("端口确定")
 
             // ── Shizuku 通道（幂等刷新，不依赖引擎端口）────────────────────
             //
@@ -2777,11 +3089,18 @@ object DSHRunner {
             // 所以这里失败不影响任何东西 —— 也不该影响引擎启动。
             runCatching { ShizukuBridge.start(context, prefix) }
                 .onFailure { onLog("⚠️ Shizuku 通道对齐失败: ${it.message}") }
+            mark("Shizuku 通道")
 
-            // ── 引擎状态自检 ────────────────────────────────────────────
-            // 排查 flock 时一直缺少"设备上引擎到底长什么样"的数据，
-            // 这里每次启动顺手打几行（只列目录，开销可忽略）。
-            logEngineState(context)
+            // ── 引擎状态自检 ── ★ 已挪到进程发起之后，不在这里 ★ ──────────
+            //
+            // logEngineState 会 **深度 6 递归遍历整棵 node_modules**
+            // 去找平台包与 .node 文件，再读一堆 package.json 做依赖闭包比对。
+            // 引擎的 node_modules 是几万个文件，这一步在主线程之外的启动
+            // 关键路径上纯属浪费 —— 它只产出给人看的诊断信息，
+            // 引擎能不能起来与它无关。
+            //
+            // 所以挪到 pb.start() 之后（见下面「引擎状态自检」），
+            // 让「点启动 → 进程真正发起」这条路径不再被诊断拖累。
 
             // ── 平台修正（--import 预加载）────────────────────────────────
             // flock 报错里的 "android-arm64" 是 `${process.platform}-${process.arch}`
@@ -2819,11 +3138,53 @@ object DSHRunner {
             // 可以传多次，按顺序预加载
             if (fsPatch != null) args += listOf("--import", fsPatch)
             if (spawnPatch != null) args += listOf("--import", spawnPatch)
-            args += listOf(binJsPath, "--profile", "web")
-            if (useOverlay) {
-                args += listOf("--patch", File(workDir, "android-overlay.yml").absolutePath)
+            args += binJsPath
+
+            // ★★★ 可选参数：一次扫描、统一过滤，绝不逐个试 ★★★
+            //
+            // 教训：之前是「发现一个不支持就补一个判断」，于是修完 `--no-open`
+            // 又冒出 `--host`，每次都要重新下一遍引擎才能验证，白烧用户的流量。
+            // 根因是 dsh 的参数集**随版本整体变化**（0.2.1 线认 `--no-open`，
+            // 0.2.2-rc.3 连 `--host` 都不认），逐个试必然要试很多轮。
+            //
+            // 现在改为一次性扫出该引擎支持的全部长参数，所有可选参数都按
+            // 这份集合过滤 —— 任何版本都只需**一次启动**就能把不支持的全部
+            // 同时去掉，不会再「修一个、冒一个」。
+            //
+            // ⚠️ 这里只影响**方案安装的实例**吗？不是：这段构参代码是
+            // `startNode` 共用的。但它对原本能正常启动的引擎是**零行为变化** ——
+            // 引擎支持什么参数，就照旧传什么参数。只有当引擎确实不认某个
+            // 参数时才会跳过（而那种情况原本会直接启动失败）。
+            // 所以「正常导入 / 直接下载的实例」不会受影响。
+            //
+            // ★ `supported` 已在上面的「端口确定」之前算好 ★
+            // 那条 `allocatePort` 只有在知道引擎支不支持 `--port` 之后才有意义，
+            // 所以扫描挪到了前面，这里不再重复声明（重复会编译报错）。
+
+            // --profile 是 profile 定位的根基，没有它引擎行为会完全不同，
+            // 所以单独处理：支持就传，不支持则明确报警（而不是静默跳过）。
+            if (supported.isEmpty() || "--profile" in supported) {
+                args += listOf("--profile", "web")
+            } else {
+                onLog("⚠️ 引擎不支持 --profile，可能无法加载 web profile")
             }
-            args += listOf("--no-open", "--host", "127.0.0.1", "--port", port.toString())
+
+            /** 支持才传；不支持就跳过并记一行 —— 静默跳过会让排查无从下手。 */
+            fun optional(name: String, vararg value: String) {
+                if (supported.isEmpty() || name in supported) {
+                    args += name
+                    args += value
+                } else {
+                    onLog("ℹ️ 引擎不支持 $name，已跳过")
+                }
+            }
+
+            optional("--no-open")
+            optional("--host", "127.0.0.1")
+            optional("--port", port.toString())
+            if (useOverlay) {
+                optional("--patch", File(workDir, "android-overlay.yml").absolutePath)
+            }
 
             // ★ 环境变量先收进普通 Map，ProcessBuilder 最后才构造 ★
             //
@@ -2837,6 +3198,22 @@ object DSHRunner {
             env["TMPDIR"] = tmp
             env["LD_LIBRARY_PATH"] = "$prefix/lib"
             env["PATH"] = "$prefix/bin:/system/bin"
+
+            // ★ 这里曾经加过两个「提速」环境变量，已全部删除 ★
+            //
+            // 1. `NODE_COMPILE_CACHE`（Node ≥22.1）—— 想把 V8 编译产物落盘复用。
+            //    漏掉的关键点：**缓存为空时要在编译每个模块的同时写一份缓存**，
+            //    几千个模块就是几千次随机写，第一次启动必然更慢，只有第二次起
+            //    才可能变快。实测引擎自举从 11.5s 涨到 15.7s。
+            //
+            // 2. `UV_THREADPOOL_SIZE = CPU 核数` —— 想让模块加载多用几个核。
+            //    但 CommonJS 的模块加载走的是**同步** fs，根本不经 libuv 线程池；
+            //    而手机闪存的并发队列本来就浅，8 个线程只会增加排队与切换开销。
+            //
+            // 教训：这两条都很容易「听起来合理」，但当前证据（4 次真机日志：
+            // 12507 / 11504 / 14193 / 15718ms）只能证明加入它们之后更慢。
+            // 在没有 A/B 对照的情况下，不该把猜测当优化直接合进启动路径。
+            // 详见 AGENT_NOTES.md §7「已被证伪」两节。
 
             // ── OpenSSL 的配置入口 ★ 也是「绝对路径依赖」的修法 ★ ──────────
             //
@@ -2962,29 +3339,45 @@ object DSHRunner {
                 }
             }.onFailure { DshProviderConfig.logFailure(it) }
 
-            onLog("cwd: ${workDir.absolutePath}")
-            onLog("Documents: ${documentsDir.absolutePath}")
-            onLog("xdg shim: ${xdgShim.absolutePath}")
-            onLog("DSH_HOME: ${env["DSH_HOME"]}")
-            // 数据目录现在按版本独立，日志里明确报出来，便于确认隔离生效。
-            onLog("数据目录: ${dshHomeDir.name}（本版本专用，与其他版本不互通）")
-            onLog("权限模式: ${permissionMode.id}")
+            // ── 以下全部是「只产出日志」的内容：入队，启动阶段零 I/O ──────────
+            //
+            // 原先它们在这里同步执行：6 行路径回显、一次沙箱后端探测
+            //（`verifyBwrap` 会起 `bwrap --version` 子进程）、一次 exec 策略判定。
+            // 单独看每项都只有几毫秒，但它们全排在 `pb.start()` **之前**，
+            // 而用户要的是「点启动 → 引擎尽快跑起来」。
+            //
+            // 现在统一入队，等页面显示出来后再跑（见 [deferDiag] 的注释）。
+            deferDiag {
+                onLog("cwd: ${workDir.absolutePath}")
+                onLog("Documents: ${documentsDir.absolutePath}")
+                onLog("xdg shim: ${xdgShim.absolutePath}")
+                onLog("DSH_HOME: ${env["DSH_HOME"]}")
+                onLog("数据目录: ${dshHomeDir.name}（本版本专用，与其他版本不互通）")
+                onLog("权限模式: ${permissionMode.id}")
+
+                // 沙箱后端探测：Android 一般既没有 bwrap 也没有 Landlock，
+                // 于是默认的 workspace-write 会让所有 bash 失败。必须说清楚，
+                // 否则用户只看到 agent 反复试 bash 然后报一句 dsh 内部的
+                // unsupported，完全看不出根因是本机没后端。
+                runCatching {
+                    SandboxBackend.logReport(
+                        mode = permissionMode,
+                        prefix = File(prefix),
+                        onLog = onLog
+                    )
+                }.onFailure { onLog("⚠️ 沙箱后端探测失败: ${it.message}") }
+
+                // exec 策略是与「沙箱后端」**完全不同**的一层，混在一起讲必然归错因：
+                // · 沙箱后端（bwrap / Landlock）= 命令跑起来之后能不能被隔离；
+                // · exec 策略（W^X / targetSdk）= 私有目录里的二进制能不能被 exec。
+                // 用户看到 `Permission denied` 时，先看这一行就能分清是哪一层。
+                onLog(SandboxExec.describe(context))
+            }
+
+            // 唯一留在启动路径上的告警：它关系到**安全边界**，不能等到页面就绪。
             if (permissionMode.dangerous) {
                 onLog("⚠️ 完全访问模式：命令将以 App 身份无隔离执行")
             }
-            // 沙箱后端探测。**必须在这里说清楚**：Android 一般既没有 bwrap
-            // 也没有 Landlock，于是默认的 workspace-write 会让所有 bash 失败。
-            // 不提前报的话，用户只会看到 agent 反复试 bash 然后报一句 dsh 内部的
-            // unsupported，完全看不出根因是本机没后端。
-            //
-            // 本方法运行在工作线程上，所以允许 verify=true（会起一个短命子进程）。
-            runCatching {
-                SandboxBackend.logReport(
-                    mode = permissionMode,
-                    prefix = File(prefix),
-                    onLog = onLog
-                )
-            }.onFailure { onLog("⚠️ 沙箱后端探测失败: ${it.message}") }
 
             // 这一次是全新启动：清掉上次的「正在停止」标记与残留输出，
             // 否则上一次主动停止留下的 stopping=true 会让这次崩溃被当成正常退出。
@@ -3036,9 +3429,54 @@ object DSHRunner {
             stopping = false
             synchronized(recentOutput) { recentOutput.clear() }
 
+            mark("环境与参数装配完毕")
+
             val started = pb.start()
             process = started
+            mark("pb.start() 返回")
             onLog("✅ 进程已发起，等待输出...")
+
+            // ── 引擎输出的逐行时间戳 ────────────────────────────────────
+            //
+            // 真机实测把问题彻底定位了：
+            //
+            //   ⏱ pb.start() 返回: 1ms（累计 104ms）
+            //   ⏱ 引擎自举完成（pb.start → dsh web）: 12507ms
+            //
+            // 我们自己的代码只花 0.1 秒，剩下 12.4 秒全在 Node 进程内部。
+            // 但「内部」烧在哪一段，从日志里看不出来：引擎启动期只有寥寥几行
+            // 输出（launcher 装载 → 插件加载 → dsh web:），没有时间信息就无法
+            // 判断是它在读那个 52MB 的 pnpm-native、在等网络、还是在初始化插件。
+            //
+            // 所以给每一行引擎输出加 `+Nms` 前缀（距 pb.start 的毫秒数）。
+            // 下次日志里两行之间的差值，就是那一段的真实耗时。
+            //
+            // ⚠️ 只影响**显示**：`rememberOutput` 与 [EngineLogTap] 拿到的仍是
+            // 原始行 —— 否则 URL 正则、命令识别都会因为多了前缀而失配。
+            val tSpawn = System.currentTimeMillis()
+
+            // ── 引擎状态自检：只入队，**此刻零 I/O** ──────────────────────
+            //
+            // 这个自检深度 6 递归遍历整棵 node_modules，实测 2.7～3.1 秒。
+            // 它经历了三次挪位才落到现在的位置（每次都以为是最后一次）：
+            //
+            // 1. 直接放在 pb.start() 之前 —— 拖慢进程发起；
+            // 2. 挪到 pb.start() 之后，但仍在 **stdout 读取循环之前** ——
+            //    串行执行期间引擎输出全积在管道里没人读，凭空多等 2.7 秒；
+            // 3. 挪到独立线程、等引擎就绪再跑 —— 不再堵管道，但实测引擎
+            //    反而更慢（11504ms → 14193ms），说明「和引擎抢磁盘」这个
+            //    假设也站不住。
+            //
+            // 现在的原则最简单：**启动路径上不做任何只产出日志的活**。
+            // 这里只把一个 lambda 塞进队列（零 I/O），等页面真正显示出来、
+            // 用户已经在用界面了，再由 runDeferredDiagnostics 统一跑。
+            deferDiag {
+                val version = currentVersion(context)
+                if (version != engineStateLoggedVersion) {
+                    logEngineState(context)
+                    engineStateLoggedVersion = version
+                }
+            }
 
             // 监听 stderr。
             //
@@ -3052,7 +3490,13 @@ object DSHRunner {
                     started.errorStream.bufferedReader().forEachLine {
                         // 留一份给「启动失败」时展示：用户不需要自己翻几百行 ERR
                         rememberOutput("ERR: $it")
-                        onLog("ERR: $it")
+                        // 先喂给悬浮窗的识别器：dsh 不少日志走 stderr，
+                        // 这是「AI 正在调用什么」的主要来源（见 EngineLogTap）。
+                        EngineLogTap.onLine(it)
+                        // 带 tSpawn 时间戳：见上面「引擎输出的逐行时间戳」的注释。
+                        // 放进 onLog 的字符串里而不是改 `it` 本身，
+                        // 这样 rememberOutput / EngineLogTap 拿到的仍是原始行。
+                        onLog("ERR: +${System.currentTimeMillis() - tSpawn}ms $it")
                     }
                 } catch (e: java.io.IOException) {
                     // 进程结束时的正常收场，安静退出
@@ -3071,8 +3515,28 @@ object DSHRunner {
                 while (true) {
                     val line = reader.readLine() ?: break
                     rememberOutput(line)
-                    onLog(line)
-                    regex.find(line)?.let { onUrlReady(it.value) }
+                    // 悬浮窗的状态来源：从引擎输出里认出命令与模型输出
+                    EngineLogTap.onLine(line)
+                    // 带 tSpawn 时间戳，理由见上面「引擎输出的逐行时间戳」。
+                    // `line` 本身保持原样，URL 正则与命令识别都不受影响。
+                    onLog("+${System.currentTimeMillis() - tSpawn}ms $line")
+                    regex.find(line)?.let { m ->
+                        // ★ 引擎自举耗时 ★
+                        //
+                        // 这是「我们发起进程」到「引擎自己说可以访问了」之间的真实
+                        // 间隔，也是用户感知里最长的一段。之前日志里没有这个数字，
+                        // 只能看到 ⏱ pb.start() 返回: 1ms，误以为整体已经很快。
+                        //
+                        // 这段耗时**全部在 Node 进程内部**（加载 52MB 的
+                        // pnpm-native、初始化插件、拉取模型列表…），本仓库改不动，
+                        // 但必须量出来 —— 否则无法判断该继续优化我们自己的代码，
+                        // 还是该去改引擎侧。
+                        onLog("⏱ 引擎自举完成（pb.start → dsh web）: ${System.currentTimeMillis() - tStart}ms")
+                        // 这里**不**触发诊断：引擎刚就绪，页面还要加载、WebView
+                        // 还要建，绝不是抢资源的时候。诊断等页面真正显示出来
+                        // （DshWebActivity.onPageFinished → notePageLoaded）再跑。
+                        onUrlReady(m.value)
+                    }
                 }
                 // 循环正常结束 = 流到 EOF = 进程已退出。
                 // 这里以前只写一句日志就收工，runState 会永远停在 STARTING。
@@ -3093,6 +3557,21 @@ object DSHRunner {
                     process = null
                     currentPort = 0
                     val code = runCatching { started.exitValue() }.getOrNull()
+
+                    // ★ 「除非遇到问题」那一半 ★
+                    //
+                    // 放在这个 if 里而不是 finally 顶部，是因为这里的语义才是
+                    // 「进程自己没了」：用户主动停止时 stopProcess() 已把 process
+                    // 置空，会跳过这一段 —— 否则一次「停止 → 再启动」的重启流程里，
+                    // 旧进程的收尾线程会把**新一轮**刚入队的诊断提前吃掉，
+                    // 页面就绪时反而什么都不打印。
+                    //
+                    // 真正的崩溃/启动失败恰恰最需要这些信息，所以立刻跑，
+                    // 不等页面（页面大概率根本不会出）。
+                    // 若页面已经正常显示过，runDeferredDiagnostics 早已跑过，
+                    // 这里的调用是幂等空操作。
+                    runDeferredDiagnostics("引擎异常退出")
+
                     onExited?.invoke(stopping, code)
                 }
             }

@@ -3,16 +3,7 @@ package com.example.fcldsh
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -21,12 +12,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -60,36 +46,89 @@ import java.util.Locale
 @Composable
 fun SkillDownloadPanel(onImport: () -> Unit) {
     val context = LocalContext.current
-    var url by remember { mutableStateOf("") }
+    val main = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
 
-    // 订阅安装状态：busy 变化要禁用按钮，message 变化要显示结果
-    val busy = SkillInstaller.busy
-    val message = SkillInstaller.message
-
-    // 装完后列表要刷新：用 busy 的 true→false 边沿自增一个键。
+    // ── 查询状态 ────────────────────────────────────────────────────
     //
-    // 不能直接 `remember(busy)` —— 安装**开始**时也会重算一次扫描，
-    // 而那时磁盘还没变化，白扫一遍。只在结束时刷才对。
-    var refreshKey by remember { mutableStateOf(0) }
-    var prevBusy by remember { mutableStateOf(false) }
-    LaunchedEffect(busy) {
-        if (prevBusy && !busy) refreshKey++
-        prevBusy = busy
+    // 「输入框里的文字」与「真正生效的关键词」分开保存：
+    // 合成一个的话，每敲一个字就要打一次上游接口（那边没有防抖的理由）。
+    var input by remember { mutableStateOf("") }
+    var keyword by remember { mutableStateOf("") }
+
+    var sort by remember { mutableStateOf(SkillHub.Sort.SCORE) }
+
+    // ★ 页码 0 起 ★ 与 [PageBar] 保持一致（它内部显示时 +1，"第 1 页"）。
+    // 只有调 SkillHub.list 那一刻才转成上游的 1 起页码。
+    var page by remember { mutableStateOf(0) }
+
+    // 跳页小窗是否打开（复用插件页的 [JumpPageDialog]）
+    var jumpDialog by remember { mutableStateOf(false) }
+
+    var items by remember { mutableStateOf<List<SkillHub.Skill>>(emptyList()) }
+    var total by remember { mutableStateOf(0) }
+    var loading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var reload by remember { mutableStateOf(0) }
+
+    // ── 安装状态 ────────────────────────────────────────────────────
+    var installing by remember { mutableStateOf<String?>(null) }
+    var installMsg by remember { mutableStateOf("") }
+
+    // 拉取当前页。keyword / sort / page / reload 任一变化都重跑。
+    //
+    // 每次都**整页替换**而不是追加：分页条是「跳到第 N 页」的语义，
+    // 累加会让第 2 页显示成「第 1 页 + 第 2 页」，页码与实际内容对不上。
+    LaunchedEffect(keyword, sort, page, reload) {
+        loading = true
+        error = null
+        val want = page
+        val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            // 上游页码从 1 起，本地从 0 起
+            runCatching { SkillHub.list(keyword, sort, want + 1, PAGE_SIZE) }
+        }
+        loading = false
+        result.onSuccess { p ->
+            // 只在仍然是同一页时才写入：快速连点翻页时，
+            // 先发出、后返回的慢请求不该覆盖后发出的结果。
+            if (page == want) {
+                items = p.skills
+                total = p.total
+            }
+        }.onFailure {
+            if (page == want) error = it.message ?: it.javaClass.simpleName
+        }
     }
 
-    val dshHome = remember { DSHRunner.dshHome(context) }
-    val scan = remember(refreshKey) { scanSkills(dshHome) }
+    /** 装一个技能。全程后台线程，结束回主线程更新界面。 */
+    fun startInstall(s: SkillHub.Skill) {
+        if (installing != null) return
+        installing = s.key
+        installMsg = "正在安装「${s.name}」…"
+        Thread {
+            val n = SkillHub.install(context, s) { line -> DSHRunner.onLog(line) }
+            val msg = if (n >= 0) {
+                "✅ 已安装「${s.name}」（$n 个文件），新会话可用"
+            } else {
+                "❌ 安装失败：${s.name}，详见运行日志"
+            }
+            DSHRunner.onLog(msg)
+            main.post {
+                installing = null
+                installMsg = msg
+            }
+        }.start()
+    }
 
     Row(modifier = Modifier.fillMaxSize().padding(12.dp)) {
 
-        // ── 左栏：安装入口 + 推荐来源（1/3）────────────────────────────
+        // ── 左栏：搜索 / 排序 / 导入（1/3）──────────────────────────────
         Column(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxHeight()
                 .verticalScroll(rememberScrollState())
         ) {
-            FclSettingSection("从链接安装")
+            FclSettingSection("搜索")
 
             Surface(
                 modifier = Modifier.fillMaxWidth(),
@@ -98,14 +137,14 @@ fun SkillDownloadPanel(onImport: () -> Unit) {
             ) {
                 Column(modifier = Modifier.padding(Fcl.RowPadding)) {
                     LinkedField(
-                        value = url,
-                        placeholder = "GitHub 仓库或 SKILL.md 链接",
-                        onChange = { url = it }
+                        value = input,
+                        placeholder = "关键词，如 搜索 / 编程 / 写作",
+                        onChange = { input = it }
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "支持：GitHub 仓库 / 仓库子目录 / SKILL.md 直链 / zip 直链。" +
-                            "装进当前实例的 skills 目录，重启实例后生效。",
+                        text = "数据来自 SkillHub（skillhub.cn）。留空即浏览全部，" +
+                            "装进当前实例的 skills 目录。",
                         color = Fcl.TextTertiary,
                         fontSize = 10.sp,
                         lineHeight = 14.sp
@@ -115,19 +154,54 @@ fun SkillDownloadPanel(onImport: () -> Unit) {
 
             Spacer(modifier = Modifier.height(6.dp))
             FillButton(
-                text = if (busy) "安装中…" else "安装",
-                enabled = !busy && url.isNotBlank()
+                text = if (loading && page == 0) "搜索中…" else "搜索",
+                enabled = !loading
             ) {
-                SkillInstaller.installFromUrl(context, url)
+                keyword = input.trim()
+                // 换关键词必须回到第一页：否则会去请求「新关键词的第 7 页」，
+                // 大概率直接跳空。
+                page = 0
             }
 
-            if (message.isNotBlank()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            FclSettingSection("排序")
+            SkillHub.Sort.values().forEachIndexed { i, s ->
+                FclSettingRow(
+                    label = s.label,
+                    shape = RowShape.of(i, SkillHub.Sort.values().size),
+                    onClick = {
+                        if (sort != s) {
+                            sort = s
+                            page = 0
+                        }
+                    }
+                ) {
+                    Text(
+                        text = if (sort == s) "✓" else "",
+                        color = Fcl.Success,
+                        fontSize = 11.sp
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            FclSettingSection("本地导入")
+            FclSettingRow(
+                label = "从文件导入",
+                description = "自己打包的 skill zip，或别人给的包（不经 SkillHub）。",
+                shape = RowShape.SINGLE,
+                onClick = if (installing != null) null else onImport
+            ) {
+                Text(text = "选择文件", color = Fcl.ThemeText, fontSize = 12.sp)
+            }
+
+            if (installMsg.isNotBlank()) {
                 Spacer(modifier = Modifier.height(6.dp))
                 FclSettingRow(
-                    label = message,
+                    label = installMsg,
                     shape = RowShape.SINGLE
                 ) {
-                    if (busy) {
+                    if (installing != null) {
                         CircularProgressIndicator(
                             modifier = Modifier.width(14.dp).height(14.dp),
                             strokeWidth = 2.dp,
@@ -135,44 +209,11 @@ fun SkillDownloadPanel(onImport: () -> Unit) {
                         )
                     } else {
                         Text(
-                            text = if (message.startsWith("❌")) "失败" else "完成",
-                            color = if (message.startsWith("❌")) Fcl.Danger else Fcl.Success,
+                            text = if (installMsg.startsWith("❌")) "失败" else "完成",
+                            color = if (installMsg.startsWith("❌")) Fcl.Danger else Fcl.Success,
                             fontSize = 10.sp
                         )
                     }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-            FclSettingSection("导入本地包")
-            FclSettingRow(
-                label = "从文件导入",
-                description = "在实例设置里打包好的 skill zip，或别人给的包。",
-                shape = RowShape.SINGLE,
-                onClick = if (busy) null else onImport
-            ) {
-                Text(text = "选择文件", color = Fcl.ThemeText, fontSize = 12.sp)
-            }
-
-            // ── 推荐来源：点开系统浏览器 ──
-            Spacer(modifier = Modifier.height(6.dp))
-            FclSettingSection("推荐来源")
-            val sources = listOf(
-                "Anthropic 官方示例" to "https://github.com/anthropics/skills",
-                "ComposioHQ 合集" to "https://github.com/ComposioHQ/awesome-claude-skills",
-                "VoltAgent 合集" to "https://github.com/VoltAgent/awesome-claude-skills",
-                "obra 实战技能" to "https://github.com/obra/superpowers",
-                "科研方向合集" to "https://github.com/K-Dense-AI/claude-scientific-skills",
-                "skills.sh 导航" to "https://skills.sh"
-            )
-            sources.forEachIndexed { i, (name, link) ->
-                FclSettingRow(
-                    label = name,
-                    description = link,
-                    shape = RowShape.of(i, sources.size),
-                    onClick = { openUrl(context, link) }
-                ) {
-                    Text(text = "打开", color = Fcl.ThemeText, fontSize = 12.sp)
                 }
             }
 
@@ -181,178 +222,162 @@ fun SkillDownloadPanel(onImport: () -> Unit) {
 
         Spacer(modifier = Modifier.width(10.dp))
 
-        // ── 右栏：已安装（2/3）──────────────────────────────────────────
-        Column(
-            modifier = Modifier
-                .weight(2f)
-                .fillMaxHeight()
-                .verticalScroll(rememberScrollState())
-        ) {
-            FclSettingSection("已安装 skill（${scan.items.size}）")
+        // ── 右栏：市场列表（2/3）────────────────────────────────────────
+        //
+        // 这一栏只列**市场上有什么**，不列本机已装了什么 ——
+        // 已装技能的管理归「实例设置 → skill 管理」，两处各管一件事。
+        //
+        // 结构照插件下载页：分页条固定在顶部，只有列表滚动。
+        Column(modifier = Modifier.weight(2f).fillMaxHeight()) {
+            val pageCount = ((total + PAGE_SIZE - 1) / PAGE_SIZE).coerceAtLeast(1)
+            // 结果集变小后旧页码可能越界（换关键词、换排序都会），夹回来
+            val safePage = page.coerceIn(0, pageCount - 1)
+            if (safePage != page) page = safePage
 
-            if (scan.items.isEmpty()) {
-                Hint(
-                    "还没有 skill。可以从左侧粘一个链接安装，" +
-                        "或到「实例设置 → skill 管理」导入本地包。"
-                )
-            } else {
-                scan.items.forEachIndexed { i, s ->
+            FclSettingSection("SkillHub 技能（$total）")
+
+            // ★ 分页条固定在滚动容器之外 ★
+            //
+            // 放进列表里会跟着被划走：翻到第 3 屏想回第一页，得先滑回顶部。
+            PageBar(
+                page = safePage,
+                pageCount = pageCount,
+                onJump = { jumpDialog = true },
+                onPrev = { page = (safePage - 1).coerceAtLeast(0) },
+                onNext = { page = (safePage + 1).coerceAtMost(pageCount - 1) },
+                onFirst = { page = 0 },
+                onLast = { page = pageCount - 1 }
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+            ) {
+            when {
+                error != null -> {
+                    Hint("❌ 拉取失败：$error")
+                    Spacer(modifier = Modifier.height(6.dp))
                     FclSettingRow(
-                        label = s.title.ifBlank { s.id },
-                        description = "${s.path} · ${s.fileCount} 个文件 · " +
-                            sizeLabel(s.size),
-                        shape = RowShape.SINGLE
+                        label = "重试",
+                        shape = RowShape.SINGLE,
+                        onClick = if (loading) null else { { reload++ } }
                     ) {
-                        Text(text = "已装", color = Fcl.Success, fontSize = 10.sp)
+                        Text(text = "重新加载", color = Fcl.ThemeText, fontSize = 12.sp)
                     }
-                    if (i < scan.items.size - 1) Spacer(modifier = Modifier.height(4.dp))
+                }
+
+                items.isEmpty() && loading -> {
+                    Hint("正在读取 SkillHub…")
+                }
+
+                items.isEmpty() -> {
+                    Hint(
+                        if (keyword.isBlank()) "这个源没有返回任何技能。"
+                        else "没有匹配「$keyword」的技能，换个关键词试试。"
+                    )
+                }
+
+                else -> {
+                    items.forEachIndexed { i, s ->
+                        FclSettingRow(
+                            label = s.name,
+                            description = buildString {
+                                // 第一行：来源与热度
+                                if (s.publisher.isNotBlank()) {
+                                    append(s.publisher)
+                                    if (s.publisherVerified) append(" ✓")
+                                    append(" · ")
+                                }
+                                append(fmtCount(s.downloads))
+                                append(" 次下载")
+                                if (s.stars > 0) {
+                                    append(" · ")
+                                    append(fmtCount(s.stars))
+                                    append(" 星")
+                                }
+                                if (s.version.isNotBlank()) {
+                                    append(" · v")
+                                    append(s.version)
+                                }
+                                if (s.needsApiKey) append(" · 需 API Key")
+                                // 第二段：简介
+                                if (s.description.isNotBlank()) {
+                                    append("\n")
+                                    append(s.description)
+                                }
+                            },
+                            descMaxLines = 3,
+                            // 分页之后列表是「一页就是这几条」，圆角按本页行数收口即可
+                            shape = RowShape.of(i, items.size)
+                        ) {
+                            when {
+                                installing == s.key -> Text(
+                                    text = "安装中…",
+                                    color = Fcl.TextTertiary,
+                                    fontSize = 10.sp
+                                )
+                                installing != null -> Text(
+                                    text = "等待",
+                                    color = Fcl.TextTertiary,
+                                    fontSize = 10.sp
+                                )
+                                else -> Text(
+                                    text = "安装",
+                                    color = Fcl.ThemeText,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(Fcl.Radius))
+                                        .fclClickable { startInstall(s) }
+                                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+                        if (i < items.size - 1) Spacer(modifier = Modifier.height(4.dp))
+                    }
+
                 }
             }
 
             Spacer(modifier = Modifier.height(10.dp))
+            }
         }
+    }
+
+    // ── 跳页小窗（与插件下载页共用同一个组件）──────────────────────
+    //
+    // 页码的显示与跳转都由 [PageBar] / [JumpPageDialog] 负责，
+    // 这里只把「当前页」这个状态接上。
+    if (jumpDialog) {
+        JumpPageDialog(
+            page = page,
+            pageCount = ((total + PAGE_SIZE - 1) / PAGE_SIZE).coerceAtLeast(1),
+            perPage = PAGE_SIZE,
+            onDismiss = { jumpDialog = false },
+            onJump = { target ->
+                page = target
+                jumpDialog = false
+            }
+        )
     }
 }
 
+/** 每页条数。20 足够填满一屏，又不至于一次拉太多。 */
+private const val PAGE_SIZE = 20
+
 /**
- * 下载中心 · MCP 下载页。
+ * 下载量 / 星数的人类可读写法。
  *
- * ## 为什么这一页主要是「入口」而不是「列表」
- *
- * 与 skill 同理，而且更极端：MCP 服务器是**要跑起来的东西**，
- * 它的生态由注册表与市场构成（官方 registry、聚合目录、社区目录），
- * 每个源的结构都不同，没有一份可以拉到本地翻页的统一清单。
- *
- * 所以这里给的是：**去哪找**（可点开的注册表与市场）+ **怎么装进来**
- * （导入包 / 用插件渠道装 bundle 形式的 MCP 连接器）。
- * 硬造一个假列表，用户点进去也装不了任何东西。
+ * 上游的 `downloads` 是六到八位数（实测 `11469861`），原样显示会把一行撑爆，
+ * 也不利于快速比较。中文习惯用「万」，这里只做到万位。
  */
-@Composable
-fun McpDownloadPanel(onImport: () -> Unit) {
-    val context = LocalContext.current
-    val dshHome = remember { DSHRunner.dshHome(context) }
-    val scan = remember { scanMcpConfigs(dshHome) }
-    val totalServers = scan.configs.sumOf { it.servers.size }
-
-    Row(modifier = Modifier.fillMaxSize().padding(12.dp)) {
-
-        // ── 左栏：安装入口（1/3）────────────────────────────────────────
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxHeight()
-                .verticalScroll(rememberScrollState())
-        ) {
-            FclSettingSection("装进当前实例")
-
-            FclSettingRow(
-                label = "导入 MCP 包",
-                description = "别人打包好的 MCP 配置 zip（含 bundle 形式的脚本）。",
-                shape = RowShape.SINGLE,
-                onClick = onImport
-            ) {
-                Text(text = "选择文件", color = Fcl.ThemeText, fontSize = 12.sp)
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-            FclSettingRow(
-                label = "用插件渠道装",
-                description = "bundle 形式的 MCP（cordis.patch.yml + 脚本）本质是插件，" +
-                    "到「插件下载」里找对应的连接器更可靠。",
-                shape = RowShape.SINGLE
-            ) {
-                Text(text = "说明", color = Fcl.TextTertiary, fontSize = 10.sp)
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-            FclSettingSection("统计")
-            FclSettingRow(
-                label = "${scan.configs.size} 个配置文件",
-                description = "共 $totalServers 个已登记的服务。增删请在 dsh 或对应插件里操作。",
-                shape = RowShape.SINGLE
-            ) {
-                Text(text = "只读", color = Fcl.TextTertiary, fontSize = 10.sp)
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-        }
-
-        Spacer(modifier = Modifier.width(10.dp))
-
-        // ── 右栏：去哪找 + 已装（2/3）───────────────────────────────────
-        Column(
-            modifier = Modifier
-                .weight(2f)
-                .fillMaxHeight()
-                .verticalScroll(rememberScrollState())
-        ) {
-            FclSettingSection("注册表与市场")
-            val markets = listOf(
-                "官方 MCP 注册表" to "https://registry.modelcontextprotocol.io",
-                "MCP.so" to "https://mcp.so",
-                "ModelScope MCP 广场" to "https://modelscope.cn/mcp",
-                "PulseMCP" to "https://www.pulsemcp.com",
-                "Glama MCP" to "https://glama.ai/mcp",
-                "官方服务器目录" to "https://github.com/VoltAgent/official-mcp-servers",
-                "社区精选列表" to "https://github.com/wong2/awesome-mcp-servers"
-            )
-            markets.forEachIndexed { i, (name, link) ->
-                FclSettingRow(
-                    label = name,
-                    description = link,
-                    shape = RowShape.of(i, markets.size),
-                    onClick = { openUrl(context, link) }
-                ) {
-                    Text(text = "打开", color = Fcl.ThemeText, fontSize = 12.sp)
-                }
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = "⚠️ MCP 服务器会以你的权限运行。只装你信任的来源。",
-                color = Fcl.Warning,
-                fontSize = 10.sp,
-                lineHeight = 15.sp,
-                modifier = Modifier.padding(start = 4.dp)
-            )
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            FclSettingSection("已安装（${scan.configs.size}）")
-            if (scan.configs.isEmpty()) {
-                Hint(
-                    "还没有 MCP 配置。装好之后会出现在这里，" +
-                        "也可以在「实例设置 → mcp 管理」里查看与导出。"
-                )
-            } else {
-                scan.configs.forEach { cfg ->
-                    FclSettingRow(
-                        label = cfg.rel.substringAfterLast('/'),
-                        description = buildString {
-                            append(cfg.rel)
-                            if (cfg.parseError != null) {
-                                append("\n⚠️ ${cfg.parseError}")
-                            } else if (cfg.servers.isEmpty()) {
-                                append("\n没有登记任何服务")
-                            } else {
-                                append("\n${cfg.servers.size} 个服务")
-                            }
-                        },
-                        shape = RowShape.SINGLE
-                    ) {
-                        Text(
-                            text = if (cfg.bundle) "bundle" else "配置",
-                            color = if (cfg.bundle) Fcl.ThemeText else Fcl.TextTertiary,
-                            fontSize = 10.sp
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(4.dp))
-                }
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-        }
-    }
+private fun fmtCount(n: Long): String = when {
+    n >= 100_000_000L -> String.format(Locale.ROOT, "%.1f 亿", n / 100_000_000.0)
+    n >= 10_000L -> String.format(Locale.ROOT, "%.1f 万", n / 10_000.0)
+    else -> n.toString()
 }
 
 // ----------------------------------------------------------------------
@@ -447,10 +472,6 @@ private fun FillButton(
     }
 }
 
-/** 体积文案。 */
-private fun sizeLabel(bytes: Long): String = when {
-    bytes >= 1024L * 1024L ->
-        String.format(Locale.ROOT, "%.1f MB", bytes / 1024.0 / 1024.0)
-    bytes >= 1024L -> String.format(Locale.ROOT, "%.1f KB", bytes / 1024.0)
-    else -> "$bytes B"
-}
+// `sizeLabel(bytes)` 已删除：它只服务于「已安装 skill」列表，
+// 而 skill 下载页改成 SkillHub 市场后不再列本机已装项，这个函数就没人用了。
+// 体积格式化在 SkillHub.install 内部另有实现（日志里那一句）。

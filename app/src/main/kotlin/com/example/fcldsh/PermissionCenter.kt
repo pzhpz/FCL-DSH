@@ -68,7 +68,8 @@ object PermissionCenter {
         allFilesAccess(context),
         notifications(context),
         batteryOptimization(context),
-        accessibility(context)
+        accessibility(context),
+        overlay(context)
     )
 
     // ------------------------------------------------------------------
@@ -256,6 +257,61 @@ object PermissionCenter {
     }
 
     // ------------------------------------------------------------------
+    // 6. 显示在其他应用上层（SYSTEM_ALERT_WINDOW，即悬浮窗权限）
+    // ------------------------------------------------------------------
+
+    /**
+     * 「任务悬浮窗」所需的系统权限。
+     *
+     * ## 这是特殊权限，不是运行时权限
+     *
+     * `SYSTEM_ALERT_WINDOW` **没有**运行时申请通道：`requestPermissions()`
+     * 对它无效，系统只会给出 `PERMISSION_DENIED` 且不弹框。唯一的途径
+     * 是把用户送到 `ACTION_MANAGE_OVERLAY_PERMISSION` 页面自己拨开关，
+     * 所以这里和「所有文件访问」「电池优化」一样只做引导。
+     *
+     * 状态用 [TaskOverlay.hasPermission] 判定 —— 那里已经把
+     * `Settings.canDrawOverlays` 包在 runCatching 里，个别 ROM 上丢异常
+     * 也不会让设置页打不开。
+     *
+     * 文案刻意说明「开了能看到什么」：这一项的开关在应用内（权限设置页
+     * 的任务悬浮窗一行），而这里只负责系统那一层授权。用户很容易把
+     * 「系统允许画浮窗」和「本次要显示浮窗」混为一谈。
+     */
+    private fun overlay(context: Context): Entry {
+        val title = "显示在其他应用上层"
+        val desc = "「任务悬浮窗」需要它：dsh 运行期间退到后台时，在屏幕上留一块小卡片，" +
+            "显示 agent 的状态（暂无输出 / 正在思考 / 调用工具）"
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            // minSdk 是 23，实际走不到；留着是为了以后调低 minSdk 时不出错。
+            return Entry(
+                key = "overlay",
+                title = title,
+                desc = desc,
+                status = Status.UNSUPPORTED,
+                statusText = "系统版本不支持",
+                actionText = null,
+                open = null
+            )
+        }
+
+        val granted = TaskOverlay.hasPermission(context)
+        return Entry(
+            key = "overlay",
+            title = title,
+            desc = desc,
+            status = if (granted) Status.GRANTED else Status.DENIED,
+            statusText = if (granted) "已授权" else "未授权",
+            actionText = if (granted) null else "去授权",
+            open = if (granted) null else Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:${context.packageName}")
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+
+    // ------------------------------------------------------------------
     // 辅助
     // ------------------------------------------------------------------
 
@@ -293,7 +349,18 @@ object PermissionCenter {
             if (runCatching { activity.startActivity(fallbackBattery) }.isSuccess) return true
         }
 
-        // 退化 3：都失败就去本应用详情页，至少那里能看到权限入口
+        // 退化 3：悬浮窗专属页失败时，改用不带包名的同一个 action。
+        //
+        // 部分 ROM 缺少「按包名直达」的页面，但保留了这个 action 的全局列表
+        // （系统里叫「显示在其他应用上层」/「特殊应用权限」）。
+        // 不带 data 时系统会落到列表页，用户仍能自己找到本应用。
+        if (intent.action == Settings.ACTION_MANAGE_OVERLAY_PERMISSION) {
+            val fallbackOverlay = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (runCatching { activity.startActivity(fallbackOverlay) }.isSuccess) return true
+        }
+
+        // 退化 4：都失败就去本应用详情页，至少那里能看到权限入口
         return runCatching {
             activity.startActivity(appDetailsIntent(activity))
         }.isSuccess
